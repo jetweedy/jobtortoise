@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-peopleadmin_scraper.py
+python scraper4.py --inputs schools.txt --query data --max-pages 5 --details
 
 Scrape job postings from PeopleAdmin installations (common at colleges).
 
@@ -8,8 +8,17 @@ Input: a text file with one school domain per line (e.g., unc.edu).
 The script tries multiple likely base URL patterns for each domain, then queries:
   /postings/search?page=1&query=<term>
 
-Optional: --details to fetch each posting's detail page and attempt to extract
-salary, posted date, close date, etc.
+Upgrades in this version:
+- Tries to fetch search results via JSON-ish endpoints first (when available),
+  then falls back to HTML parsing.
+- For details, prefers /postings/<id>/print_preview (simpler page) and falls back
+  to the normal posting page.
+
+Optional:
+  --details        Fetch each posting detail page for salary/dates/etc.
+  --store-html     Store raw detail HTML too (can get large)
+  --prefer-json    Try JSON-ish endpoints before HTML (default: on)
+  --no-prefer-json Disable JSON probing
 
 Outputs JSONL (one posting per line) and a summary to stdout.
 """
@@ -23,7 +32,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List, Set, Tuple
+from typing import Optional, Dict, List, Set, Tuple, Any
 from urllib.parse import urljoin, urlencode, urlparse
 
 import requests
@@ -57,15 +66,29 @@ class Posting:
     full_time_or_part_time: Optional[str] = None
     special_instructions: Optional[str] = None
 
+    # store whole posting content for later parsing/search
+    detail_text: Optional[str] = None
+    detail_html: Optional[str] = None  # optional, can be large
+
+    # debug / provenance (helpful when mixing HTML + JSON)
+    search_mode: Optional[str] = None  # "json" or "html"
+    search_endpoint: Optional[str] = None
+
 
 # -----------------------------
 # Config / constants
 # -----------------------------
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PeopleAdminScraper/1.1; +https://example.com/bot-info)",
+    "User-Agent": "Mozilla/5.0 (compatible; PeopleAdminScraper/1.3; +https://truewindtechnology.com/)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Headers that sometimes coax "XHR" style responses
+XHR_HEADERS = {
+    "Accept": "application/json,text/plain,*/*",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 BASE_PATTERNS = [
@@ -86,7 +109,23 @@ PEOPLEADMIN_FINGERPRINTS = [
     "postings",
 ]
 
-# Label normalization / mapping for detail pages
+# Candidate JSON-ish search endpoints (not guaranteed; we probe a few common ones)
+# NOTE: these are *heuristics*, because PeopleAdmin tenant implementations vary.
+JSON_SEARCH_TEMPLATES = [
+    # If you discover a consistent real endpoint for a tenant, add it here.
+    "{base}/postings/search.json?{qs}",
+    "{base}/postings/search.json?{qs}&format=json",
+    "{base}/postings/search?{qs}&format=json",
+    "{base}/postings/search?{qs}&output=1&format=json",
+    # sometimes adding these headers to the normal search can return JSON-ish output
+    "{base}/postings/search?{qs}",
+]
+
+
+# -----------------------------
+# Text / label helpers
+# -----------------------------
+
 def clean_text(s: str) -> str:
     return " ".join((s or "").replace("\xa0", " ").split()).strip()
 
@@ -95,6 +134,31 @@ def norm_label(s: str) -> str:
     s = re.sub(r"[:\s]+$", "", s)
     return s
 
+def extract_visible_text(soup: BeautifulSoup) -> str:
+    """
+    Extract readable page text, removing scripts/styles/noscript.
+    Returns newline-separated text with blank lines collapsed.
+    """
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text(separator="\n", strip=True)
+    lines = [clean_text(line) for line in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+def parse_bool(val: str) -> Optional[bool]:
+    v = clean_text(val).lower()
+    if v in ("yes", "y", "true"):
+        return True
+    if v in ("no", "n", "false"):
+        return False
+    if "open until filled" in v:
+        return True
+    return None
+
+
+# Map “label text on page” -> Posting field name
 LABEL_MAP: Dict[str, str] = {
     # salary-ish
     "salary": "salary",
@@ -133,7 +197,43 @@ LABEL_MAP: Dict[str, str] = {
 
 
 # -----------------------------
-# Utility
+# Salary normalization
+# -----------------------------
+
+def extract_salary_numbers(s: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract all $ amounts from a string; return (min_salary, max_salary) as formatted strings.
+    Examples:
+      "$80,000" -> ("$80,000", "$80,000")
+      "$30,000 to $40,000" -> ("$30,000", "$40,000")
+      "$22.50/hour - $25.00/hour" -> ("$22", "$25")  (rounded)
+    """
+    if not s:
+        return None, None
+
+    matches = re.findall(r"\$[\d,]+(?:\.\d{1,2})?", s)
+    if not matches:
+        return None, None
+
+    values: List[float] = []
+    for m in matches:
+        num = m.replace("$", "").replace(",", "")
+        try:
+            values.append(float(num))
+        except ValueError:
+            continue
+
+    if not values:
+        return None, None
+
+    mn = min(values)
+    mx = max(values)
+
+    return f"${mn:,.0f}", f"${mx:,.0f}"
+
+
+# -----------------------------
+# Misc utility
 # -----------------------------
 
 def normalize_domain(s: str) -> str:
@@ -165,12 +265,39 @@ def build_search_url(base_url: str, query: str, page: int) -> str:
     params = {"page": page, "query": query}
     return f"{base_url.rstrip('/')}{path}?{urlencode(params)}"
 
-def fetch(session: requests.Session, url: str, timeout: float) -> Tuple[Optional[requests.Response], Optional[str]]:
+def fetch(session: requests.Session, url: str, timeout: float, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[requests.Response], Optional[str]]:
     try:
-        resp = session.get(url, timeout=timeout, allow_redirects=True)
+        resp = session.get(url, timeout=timeout, allow_redirects=True, headers=headers)
         return resp, None
     except requests.RequestException as e:
         return None, str(e)
+
+def try_parse_json(resp: requests.Response) -> Optional[Any]:
+    """
+    Attempt to parse a response as JSON safely.
+    Returns parsed object or None.
+    """
+    if resp is None:
+        return None
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    text = resp.text or ""
+
+    # Strong signals
+    if "application/json" in ct:
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    # Weak signals
+    t = text.lstrip()
+    if t.startswith("{") or t.startswith("["):
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    return None
 
 def candidate_bases_for_domain(domain: str) -> List[str]:
     d = normalize_domain(domain)
@@ -187,6 +314,22 @@ def candidate_bases_for_domain(domain: str) -> List[str]:
             out.append(b)
             seen.add(b)
     return out
+
+def posting_print_preview_url(posting_url: str) -> str:
+    """
+    Prefer the print preview variant: /postings/<id>/print_preview
+    """
+    # If already has print_preview, keep it
+    if posting_url.endswith("/print_preview"):
+        return posting_url
+
+    # Ensure it's /postings/<id>...
+    m = re.search(r"(.*?/postings/\d+)", posting_url)
+    if m:
+        return m.group(1) + "/print_preview"
+
+    # fallback: append
+    return posting_url.rstrip("/") + "/print_preview"
 
 
 # -----------------------------
@@ -212,8 +355,7 @@ def choose_working_base(session: requests.Session, domain: str, query: str, time
 
         if is_likely_peopleadmin(html, final_url):
             parsed = urlparse(final_url)
-            normalized_base = f"{parsed.scheme}://{parsed.netloc}"
-            return normalized_base
+            return f"{parsed.scheme}://{parsed.netloc}"
 
         polite_sleep(0.05, 0.2)
 
@@ -221,7 +363,149 @@ def choose_working_base(session: requests.Session, domain: str, query: str, time
 
 
 # -----------------------------
-# Search page parsing
+# Search via JSON-ish endpoints (best effort)
+# -----------------------------
+
+def extract_postings_from_search_json(
+    obj: Any,
+    base_url: str,
+    school_input: str,
+    query: str,
+) -> List[Posting]:
+    """
+    Robust-ish extractor:
+    - Walk arbitrary JSON structure
+    - Find strings that look like /postings/<digits>
+    - Build Posting objects
+    """
+    postings: List[Posting] = []
+    seen_ids: Set[str] = set()
+
+    # Heuristic title keys commonly seen across job payloads
+    TITLE_KEYS = {"title", "position_title", "working_title", "job_title", "name"}
+    LOCATION_KEYS = {"location", "campus", "city", "work_location"}
+    DEPT_KEYS = {"department", "dept", "division", "unit"}
+
+    def find_posting_url_in_value(v: Any) -> Optional[str]:
+        if isinstance(v, str):
+            m = re.search(r"(/postings/\d+)", v)
+            if m:
+                return m.group(1)
+        return None
+
+    def walk(node: Any, context: Optional[Dict[str, Any]] = None) -> None:
+        if isinstance(node, dict):
+            # If this dict itself contains a postings link anywhere, treat as a candidate record.
+            posting_path = None
+            for vv in node.values():
+                p = find_posting_url_in_value(vv)
+                if p:
+                    posting_path = p
+                    break
+
+            if posting_path:
+                m = re.search(r"/postings/(\d+)", posting_path)
+                pid = m.group(1) if m else None
+                if pid and pid in seen_ids:
+                    return
+
+                # Title: try direct keys first
+                title = None
+                for k in node.keys():
+                    lk = str(k).lower()
+                    if lk in TITLE_KEYS:
+                        title = clean_text(str(node.get(k) or ""))
+                        if title:
+                            break
+
+                if not title and context:
+                    for k in context.keys():
+                        lk = str(k).lower()
+                        if lk in TITLE_KEYS:
+                            title = clean_text(str(context.get(k) or ""))
+                            if title:
+                                break
+
+                title = title or (f"Posting {pid}" if pid else "Posting")
+
+                # Location/Dept (best effort)
+                location = None
+                department = None
+
+                for k, v in node.items():
+                    lk = str(k).lower()
+                    if not location and lk in LOCATION_KEYS:
+                        location = clean_text(str(v or ""))
+                    if not department and lk in DEPT_KEYS:
+                        department = clean_text(str(v or ""))
+
+                abs_url = urljoin(base_url, posting_path)
+                postings.append(
+                    Posting(
+                        school_input=school_input,
+                        base_url=base_url,
+                        query=query,
+                        title=title,
+                        url=abs_url,
+                        location=location or None,
+                        department=department or None,
+                        posting_id=pid,
+                        search_mode="json",
+                    )
+                )
+                if pid:
+                    seen_ids.add(pid)
+
+            # Continue walking
+            for k, v in node.items():
+                walk(v, context=node)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, context=context)
+
+    walk(obj)
+
+    return postings
+
+def try_fetch_search_json(
+    session: requests.Session,
+    base_url: str,
+    query: str,
+    page: int,
+    timeout: float,
+) -> Tuple[Optional[List[Posting]], Optional[str]]:
+    """
+    Probe a handful of likely JSON-ish endpoints and return postings if we get JSON.
+    Returns (postings, endpoint_used)
+    """
+    qs = urlencode({"page": page, "query": query})
+
+    for tmpl in JSON_SEARCH_TEMPLATES:
+        url = tmpl.format(base=base_url.rstrip("/"), qs=qs)
+
+        # For the "plain /postings/search?..." template, use XHR-ish headers
+        hdrs = XHR_HEADERS if "/postings/search?" in url and not url.endswith(".json") else None
+
+        resp, _err = fetch(session, url, timeout=timeout, headers=hdrs)
+        if resp is None:
+            continue
+        if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
+            continue
+
+        obj = try_parse_json(resp)
+        if obj is None:
+            continue
+
+        postings = extract_postings_from_search_json(obj, base_url=base_url, school_input=base_url, query=query)
+        # Note: school_input will be overwritten by caller; here just to satisfy signature
+        if postings:
+            return postings, url
+
+    return None, None
+
+
+# -----------------------------
+# Search page parsing (HTML fallback)
 # -----------------------------
 
 def extract_postings_from_search_html(
@@ -230,9 +514,6 @@ def extract_postings_from_search_html(
     school_input: str,
     query: str
 ) -> List[Posting]:
-    """
-    Extract postings from a PeopleAdmin search results page.
-    """
     soup = BeautifulSoup(html, "html.parser")
     postings: List[Posting] = []
 
@@ -244,7 +525,6 @@ def extract_postings_from_search_html(
         if not href:
             continue
 
-        # filter out non-detail links
         if "/postings/search" in href:
             continue
         if re.search(r"/postings/(search|create|new)\b", href):
@@ -265,7 +545,6 @@ def extract_postings_from_search_html(
 
         posting_id = m.group(1)
 
-        # Optional: look around the link for label-ish things
         location = None
         department = None
 
@@ -297,6 +576,7 @@ def extract_postings_from_search_html(
                 location=location,
                 department=department,
                 posting_id=posting_id,
+                search_mode="html",
             )
         )
 
@@ -304,19 +584,8 @@ def extract_postings_from_search_html(
 
 
 # -----------------------------
-# Detail page parsing
+# Detail page parsing (label/value heuristics)
 # -----------------------------
-
-def parse_bool(val: str) -> Optional[bool]:
-    v = clean_text(val).lower()
-    if v in ("yes", "y", "true"):
-        return True
-    if v in ("no", "n", "false"):
-        return False
-    # PeopleAdmin sometimes literally prints the phrase
-    if "open until filled" in v:
-        return True
-    return None
 
 def extract_kv_from_dt_dd(soup: BeautifulSoup) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -345,8 +614,7 @@ def extract_kv_from_tables(soup: BeautifulSoup) -> Dict[str, str]:
 
 def extract_kv_from_label_value_blocks(soup: BeautifulSoup) -> Dict[str, str]:
     """
-    Heuristic: find elements whose text exactly matches known labels,
-    and grab adjacent / parent text as the value.
+    Heuristic: find elements that look like labels, then grab adjacent/parent value.
     """
     out: Dict[str, str] = {}
     candidates = soup.find_all(["div", "span", "strong", "label"])
@@ -369,48 +637,16 @@ def extract_kv_from_label_value_blocks(soup: BeautifulSoup) -> Dict[str, str]:
                 out[k] = v
     return out
 
+def scrape_detail_html(
+    html: str,
+    posting: Posting,
+    store_html: bool,
+) -> Posting:
+    soup = BeautifulSoup(html, "html.parser")
 
-def extract_salary_numbers(s: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Given a salary string, extract all dollar amounts and return
-    (min_salary, max_salary) as strings.
-    """
-    if not s:
-        return None, None
-
-    # Find all $ amounts like $30,000 or $80,000.00
-    matches = re.findall(r"\$[\d,]+(?:\.\d{2})?", s)
-    if not matches:
-        return None, None
-
-    # Convert to integers (strip $ and commas)
-    values = []
-    for m in matches:
-        num = m.replace("$", "").replace(",", "")
-        try:
-            values.append(float(num))
-        except ValueError:
-            continue
-
-    if not values:
-        return None, None
-
-    min_val = min(values)
-    max_val = max(values)
-
-    # Return formatted strings
-    return f"${min_val:,.0f}", f"${max_val:,.0f}"
-
-
-def scrape_detail_page(session: requests.Session, posting: Posting, timeout: float) -> Posting:
-    print(posting.url)
-    resp, _err = fetch(session, posting.url, timeout=timeout)
-    if resp is None:
-        return posting
-    if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
-        return posting
-
-    soup = BeautifulSoup(resp.text or "", "html.parser")
+    if store_html:
+        posting.detail_html = html
+    posting.detail_text = extract_visible_text(soup)
 
     kv: Dict[str, str] = {}
     kv.update(extract_kv_from_dt_dd(soup))
@@ -428,24 +664,44 @@ def scrape_detail_page(session: requests.Session, posting: Posting, timeout: flo
                 posting.open_until_filled = b
             continue
 
-        # don't overwrite if already filled
         if getattr(posting, canon, None) in (None, ""):
             setattr(posting, canon, raw_v)
 
-    # last-resort salary range detection
-    if not posting.salary:
-        text = clean_text(soup.get_text(" ", strip=True))
-        m = re.search(r"(\$[\d,]+(?:\.\d{2})?)\s*(?:-|to)\s*(\$[\d,]+(?:\.\d{2})?)", text)
+    if not posting.salary and posting.detail_text:
+        m = re.search(
+            r"(\$[\d,]+(?:\.\d{1,2})?)\s*(?:-|to)\s*(\$[\d,]+(?:\.\d{1,2})?)",
+            posting.detail_text
+        )
         if m:
             posting.salary = f"{m.group(1)} - {m.group(2)}"
 
-    # Normalize salary into min/max if possible
     if posting.salary:
-        min_s, max_s = extract_salary_numbers(posting.salary)
-        if min_s and not posting.salary_min:
-            posting.salary_min = min_s
-        if max_s and not posting.salary_max:
-            posting.salary_max = max_s
+        mn, mx = extract_salary_numbers(posting.salary)
+        if mn and not posting.salary_min:
+            posting.salary_min = mn
+        if mx and not posting.salary_max:
+            posting.salary_max = mx
+
+    return posting
+
+def scrape_detail_page(
+    session: requests.Session,
+    posting: Posting,
+    timeout: float,
+    store_html: bool,
+) -> Posting:
+    """
+    Try print_preview first (usually simpler), fall back to normal page.
+    """
+    candidate_urls = [posting_print_preview_url(posting.url), posting.url]
+    for u in candidate_urls:
+        resp, _err = fetch(session, u, timeout=timeout)
+        if resp is None:
+            continue
+        if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
+            continue
+        html = resp.text or ""
+        return scrape_detail_html(html=html, posting=posting, store_html=store_html)
 
     return posting
 
@@ -464,6 +720,8 @@ def scrape_school(
     min_delay: float,
     max_delay: float,
     details: bool,
+    store_html: bool,
+    prefer_json: bool,
 ) -> Tuple[List[Posting], Optional[str]]:
     base = choose_working_base(session, domain=domain, query=query, timeout=timeout)
     if not base:
@@ -473,42 +731,71 @@ def scrape_school(
     seen_posting_ids: Set[str] = set()
 
     for page in range(1, max_pages + 1):
-        url = build_search_url(base, query=query, page=page)
-        resp, _err = fetch(session, url, timeout=timeout)
-        if resp is None:
-            break
 
-        if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
-            break
-
-        html = resp.text or ""
-        if not is_likely_peopleadmin(html, str(resp.url)):
-            break
-
-        postings = extract_postings_from_search_html(html, base_url=base, school_input=school_input, query=query)
+        print(school_input, "| Page", page)
 
         new_postings: List[Posting] = []
-        for p in postings:
-            if p.posting_id and p.posting_id in seen_posting_ids:
-                continue
-            if p.posting_id:
-                seen_posting_ids.add(p.posting_id)
-            all_postings.append(p)
-            new_postings.append(p)
 
-        # stop condition: no new postings found
+        # 1) Try JSON-ish search
+        if prefer_json:
+            json_postings, endpoint = try_fetch_search_json(
+                session=session,
+                base_url=base,
+                query=query,
+                page=page,
+                timeout=timeout,
+            )
+            if json_postings:
+                # Repair fields and de-dupe
+                for p in json_postings:
+                    p.school_input = school_input
+                    p.base_url = base
+                    p.query = query
+                    p.search_endpoint = endpoint
+
+                    if p.posting_id and p.posting_id in seen_posting_ids:
+                        continue
+                    if p.posting_id:
+                        seen_posting_ids.add(p.posting_id)
+                    all_postings.append(p)
+                    new_postings.append(p)
+
+        # 2) Fallback to HTML search if JSON yielded nothing
+        if not new_postings:
+            url = build_search_url(base, query=query, page=page)
+            resp, _err = fetch(session, url, timeout=timeout)
+            if resp is None:
+                break
+
+            if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
+                break
+
+            html = resp.text or ""
+            if not is_likely_peopleadmin(html, str(resp.url)):
+                break
+
+            postings = extract_postings_from_search_html(html, base_url=base, school_input=school_input, query=query)
+            for p in postings:
+                if p.posting_id and p.posting_id in seen_posting_ids:
+                    continue
+                if p.posting_id:
+                    seen_posting_ids.add(p.posting_id)
+                all_postings.append(p)
+                new_postings.append(p)
+
         if not new_postings:
             break
 
-        # OPTIONAL: fetch detail pages for the new postings we just found on this page
+        # details for the new postings from this page
         if details:
             for i in range(len(new_postings)):
                 polite_sleep(min_delay, max_delay)
-                new_postings[i] = scrape_detail_page(session, new_postings[i], timeout=timeout)
-
-            # ensure modifications are reflected in all_postings (they are the same objects,
-            # but keep it explicit in case you refactor later)
-            # (no action needed, but harmless to keep in mind)
+                new_postings[i] = scrape_detail_page(
+                    session=session,
+                    posting=new_postings[i],
+                    timeout=timeout,
+                    store_html=store_html,
+                )
 
         polite_sleep(min_delay, max_delay)
 
@@ -543,6 +830,11 @@ def main() -> int:
     ap.add_argument("--min-delay", type=float, default=0.4, help="Min seconds between requests")
     ap.add_argument("--max-delay", type=float, default=1.1, help="Max seconds between requests")
     ap.add_argument("--details", action="store_true", help="Fetch each posting detail page for salary/dates/etc.")
+    ap.add_argument("--store-html", action="store_true", help="Store raw detail HTML in output (large).")
+    ap.add_argument("--prefer-json", dest="prefer_json", action="store_true", default=True,
+                    help="Try JSON-ish endpoints for search before HTML (default: on)")
+    ap.add_argument("--no-prefer-json", dest="prefer_json", action="store_false",
+                    help="Disable JSON probing and use HTML search only")
     ap.add_argument("--out-jsonl", default="peopleadmin_results.jsonl", help="Output JSONL path")
     args = ap.parse_args()
 
@@ -571,6 +863,8 @@ def main() -> int:
                 min_delay=args.min_delay,
                 max_delay=args.max_delay,
                 details=args.details,
+                store_html=args.store_html,
+                prefer_json=args.prefer_json,
             )
 
             if postings:
@@ -581,7 +875,11 @@ def main() -> int:
 
             total += len(postings)
             base_disp = base_used or ""
-            print(f"{raw:30s} -> {len(postings):4d} postings  {base_disp}")
+            mode_counts = {}
+            for p in postings:
+                mode_counts[p.search_mode or "unknown"] = mode_counts.get(p.search_mode or "unknown", 0) + 1
+            mode_disp = ", ".join([f"{k}:{v}" for k, v in mode_counts.items()]) if mode_counts else ""
+            print(f"{raw:30s} -> {len(postings):4d} postings  {base_disp}  [{mode_disp}]")
 
     print("\nDone.")
     print(f"Schools checked: {len(inputs)}")
