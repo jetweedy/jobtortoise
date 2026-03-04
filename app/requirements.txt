@@ -1,0 +1,7 @@
+Flask
+pymysql
+requests
+beautifulsoup4
+dotenv
+feedparser
+pandas

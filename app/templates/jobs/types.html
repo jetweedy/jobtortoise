@@ -1,0 +1,71 @@
+{% include "_header.html" %}
+{% include "_navbar.html" %}
+
+  
+  <h2>Asset Types</h2>
+
+  Type Label: <input type="text" id="asset-type-label" />
+  <button id="btn-add-asset-type">ADD</button>
+  <ul id="asset-types"></ul>
+
+
+
+
+
+<script>
+
+function deleteAssetType(at, li) {
+  if (confirm("Are you sure you want to delete Type" + at.label + "?")) {
+    $.get("/assets/deleteType/"+at.id, (x) => {
+      console.log(x);
+      if (x.success) {
+        li.remove();
+      }
+    })
+  }
+
+}
+
+function drawAssetType(at) {
+  console.log(at);
+  var li = $("<li>");
+  var a = $("<a>").html("[X]").attr("href","javascript:;");
+  a.on("click", deleteAssetType.bind(null, at, li));
+  var label = $("<label>").html(at.label);
+  li.append(a).append("&nbsp;").append(label);
+  $("#asset-types").append(li);
+}
+
+function drawAssetTypes() {
+  $.get("/assets/mytypes", (ats) => {
+    for (at of ats) {
+      drawAssetType(at);
+    }
+  })
+}
+
+function addAssetType() {
+  var label = $("#asset-type-label").val();
+  payload = {"label":label};
+  $.post("/assets/addType", payload, (x) => {
+    if (x.success) {
+      drawAssetType(x.at);
+    }
+  });
+}
+
+$("#btn-add-asset-type").on("click", addAssetType);
+
+
+
+
+drawAssetTypes();
+
+
+</script>
+
+
+
+
+
+{% include "_footer.html" %}

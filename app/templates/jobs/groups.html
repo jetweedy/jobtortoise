@@ -1,0 +1,71 @@
+{% include "_header.html" %}
+{% include "_navbar.html" %}
+
+  
+  <h2>Asset Groups</h2>
+
+  Group Label: <input type="text" id="asset-group-label" />
+  <button id="btn-add-asset-group">ADD</button>
+  <ul id="asset-groups"></ul>
+
+
+
+
+
+<script>
+
+function deleteAssetGroup(ag, li) {
+  if (confirm("Are you sure you want to delete Group" + ag.label + "?")) {
+    $.get("/assets/deleteGroup/"+ag.id, (x) => {
+      console.log(x);
+      if (x.success) {
+        li.remove();
+      }
+    })
+  }
+
+}
+
+function drawAssetGroup(ag) {
+  console.log(ag);
+  var li = $("<li>");
+  var a = $("<a>").html("[X]").attr("href","javascript:;");
+  a.on("click", deleteAssetGroup.bind(null, ag, li));
+  var label = $("<label>").html(ag.label);
+  li.append(a).append("&nbsp;").append(label);
+  $("#asset-groups").append(li);
+}
+
+function drawAssetGroups() {
+  $.get("/assets/mygroups", (ags) => {
+    for (ag of ags) {
+      drawAssetGroup(ag);
+    }
+  })
+}
+
+function addAssetGroup() {
+  var label = $("#asset-group-label").val();
+  payload = {"label":label};
+  $.post("/assets/addGroup", payload, (x) => {
+    if (x.success) {
+      drawAssetGroup(x.ag);
+    }
+  });
+}
+
+$("#btn-add-asset-group").on("click", addAssetGroup);
+
+
+
+
+drawAssetGroups();
+
+
+</script>
+
+
+
+
+
+{% include "_footer.html" %}

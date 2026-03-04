@@ -1,0 +1,191 @@
+
+html {
+  font-size: 16px;
+  font-family: Arial, sans-serif;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  padding: 1rem;
+  background-color: #f9f9f9;
+  color: #333;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 1rem;
+}
+
+table, th, td {
+  border: 1px solid #ccc;
+}
+
+th, td {
+  padding: 0.5rem;
+  text-align: center;
+}
+
+th {
+  background-color: #f0f0f0;
+}
+
+tbody tr:nth-child(even) {
+  background-color: #f2f2f2;
+}
+
+tbody tr:hover {
+  background-color: #ddd;
+}
+
+button {
+  padding: 0.4rem 0.8rem;
+  font-size: 1rem;
+  cursor: pointer;
+  border: none;
+  background-color: #007bff;
+  color: white;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+}
+
+button:hover {
+  background-color: #0056b3;
+}
+
+/* Responsive Font Scaling */
+@media (max-width: 600px) {
+  html {
+    font-size: 14px;
+  }
+
+  th, td {
+    font-size: 0.85rem;
+  }
+
+  button {
+    font-size: 0.9rem;
+    padding: 0.3rem 0.6rem;
+  }
+}
+
+@media (min-width: 1200px) {
+  html {
+    font-size: 18px;
+  }
+}
+
+/* Table scroll on small screens */
+@media (max-width: 768px) {
+  table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
+
+
+
+.subnav {
+/*  border-bottom:2px solid lightgray;  */
+}
+
+.subnav a {
+  color:black;
+  display:inline-block;
+  text-decoration:none;
+  border:1px solid gray;
+  padding:5px;
+}
+.subnav a:hover {
+  background-color:lightblue;
+}
+
+.columns {
+  display:flex;
+}
+.column {
+  flex:1;
+}
+
+@media (min-width: 768px) {
+  .column.oneHalf {
+  }
+}
+
+
+
+#main-nav {
+  position:fixed;
+  z-index:1000;
+}
+nav {
+  background: #333;
+  color: white;
+  padding: 10px;
+  position: fixed;
+  width: 100%;
+  left: 0;
+  top: 0;
+  z-index: 1000;
+}
+
+nav ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+}
+
+nav ul li {
+  position: relative;
+}
+
+nav a {
+  color: white;
+  text-decoration: none;
+  padding: 10px 15px;
+  display: block;
+}
+
+nav ul li:hover > ul {
+  display: block;
+}
+
+nav ul ul {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  background: #444;
+  min-width: 200px;
+}
+
+nav ul ul li {
+  width: 100%;
+}
+
+.auth-links {
+  float: right;
+}
+
+.auth-links a {
+  margin-left: 20px;
+}
+
+
+
+
+
+.vSpacer {
+  height:30px;
+}
+
+#main {
+  min-height:2000px;
+  margin-top:60px;
+}
+
+
+

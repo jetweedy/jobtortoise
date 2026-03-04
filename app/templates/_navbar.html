@@ -1,0 +1,41 @@
+<!-- templates/_navbar.html -->
+
+<nav id="main-nav">
+
+  <div class="auth-links">
+    {% if 'user_email' in session %}
+      <a href="/logout">Log out</a>
+    {% else %}
+      <a href="/login">Log in</a>
+    {% endif %}
+  </div>
+
+  <ul>
+
+    <li>
+      <a href="/">Home</a>
+    </li>
+
+    {% if (data.access.isAdmin) %}
+    <li>
+      <a href="#">Admin ▼</a>
+      <ul>
+        <li><a href="/admin/users">Manage Users</a></li>
+      </ul>
+    </li>
+    {% endif %}
+
+    {% if (data.access.isLoggedIn) %}
+    <li>
+      <a href="/assets">Assets ▼</a>
+      <ul>
+        <li><a href="/assets/groups">Asset Groups</a></li>
+        <li><a href="/assets/types">Asset Types</a></li>
+      </ul>
+    </li>
+    {% endif %}
+
+  </ul>
+
+</nav>
+

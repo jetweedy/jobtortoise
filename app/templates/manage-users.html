@@ -1,0 +1,94 @@
+<!-- templates/user_console.html -->
+{% include "_header.html" %}
+{% include "_navbar.html" %}
+
+<h2>User Management Console</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Email</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for user in data.users %}
+    <tr>
+      <td>{{ user.email }}</td>
+      <td>
+        <button onclick="showEdit('{{ user.email }}')">Edit</button>
+        <button onclick="deleteUser('{{ user.email }}')">Delete</button>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Add New User</h3>
+<form id="addUserForm">
+  <input type="email" name="email" placeholder="Email" required>
+  <input type="password" name="password" placeholder="Password" required>
+  <button type="submit">Add User</button>
+</form>
+
+<div id="editUserModal" style="display:none; margin-top: 1rem;">
+  <h3>Edit User Password</h3>
+  <form id="editUserForm">
+    <input type="hidden" name="email" id="editEmail">
+    <input type="password" name="password" placeholder="New Password" required>
+    <button type="submit">Update Password</button>
+  </form>
+</div>
+
+<script>
+function showEdit(email) {
+  document.getElementById('editEmail').value = email;
+  document.getElementById('editUserModal').style.display = 'block';
+}
+
+function deleteUser(email) {
+  if (!confirm(`Delete user ${email}?`)) return;
+  fetch('/admin/delete-user', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  }).then(res => res.json()).then(data => {
+    alert(data.message);
+    location.reload();
+  });
+}
+
+document.getElementById('addUserForm').onsubmit = function(e) {
+  e.preventDefault();
+  const form = new FormData(e.target);
+  fetch('/admin/add-user', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: form.get('email'),
+      password: form.get('password')
+    })
+  }).then(res => res.json()).then(data => {
+    alert(data.message);
+    location.reload();
+  });
+};
+
+document.getElementById('editUserForm').onsubmit = function(e) {
+  e.preventDefault();
+  const form = new FormData(e.target);
+  fetch('/admin/edit-user', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: form.get('email'),
+      password: form.get('password')
+    })
+  }).then(res => res.json()).then(data => {
+    alert(data.message);
+    location.reload();
+  });
+};
+</script>
+
+{% include "_footer.html" %}
