@@ -1,5 +1,5 @@
 # College Job Scrapers
 
 ## Files
- - sandbox1.py - CURRENT BEST
- - sandbox2.py - attempts to find JSON output instead
+ - sandbox1.py* - Scrapes like I want, but slow
+ - sandbox2.py - Parallelized

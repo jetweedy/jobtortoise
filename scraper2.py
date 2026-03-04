@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-python scraper4.py --inputs schools.txt --query data --max-pages 5 --details
+peopleadmin_scraper.py
 
 Scrape job postings from PeopleAdmin installations (common at colleges).
 
@@ -8,17 +8,13 @@ Input: a text file with one school domain per line (e.g., unc.edu).
 The script tries multiple likely base URL patterns for each domain, then queries:
   /postings/search?page=1&query=<term>
 
-Upgrades in this version:
-- Tries to fetch search results via JSON-ish endpoints first (when available),
-  then falls back to HTML parsing.
-- For details, prefers /postings/<id>/print_preview (simpler page) and falls back
-  to the normal posting page.
-
 Optional:
-  --details        Fetch each posting detail page for salary/dates/etc.
-  --store-html     Store raw detail HTML too (can get large)
-  --prefer-json    Try JSON-ish endpoints before HTML (default: on)
-  --no-prefer-json Disable JSON probing
+  --details     Fetch each posting detail page for salary/dates/etc.
+  --store-html  Store raw detail HTML too (can get large)
+
+Parallelism (Option B / fastest):
+  - Parallelizes schools (global thread pool)
+  - If --details is set, parallelizes detail page fetches within each school (local thread pool)
 
 Outputs JSONL (one posting per line) and a summary to stdout.
 """
@@ -32,11 +28,15 @@ import re
 import sys
 import time
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, List, Set, Tuple, Any
+from typing import Optional, Dict, List, Set, Tuple
 from urllib.parse import urljoin, urlencode, urlparse
+from threading import local, Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # -----------------------------
@@ -70,25 +70,15 @@ class Posting:
     detail_text: Optional[str] = None
     detail_html: Optional[str] = None  # optional, can be large
 
-    # debug / provenance (helpful when mixing HTML + JSON)
-    search_mode: Optional[str] = None  # "json" or "html"
-    search_endpoint: Optional[str] = None
-
 
 # -----------------------------
 # Config / constants
 # -----------------------------
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; PeopleAdminScraper/1.3; +https://truewindtechnology.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; PeopleAdminScraper/1.3; +https://example.com/bot-info)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-}
-
-# Headers that sometimes coax "XHR" style responses
-XHR_HEADERS = {
-    "Accept": "application/json,text/plain,*/*",
-    "X-Requested-With": "XMLHttpRequest",
 }
 
 BASE_PATTERNS = [
@@ -109,17 +99,50 @@ PEOPLEADMIN_FINGERPRINTS = [
     "postings",
 ]
 
-# Candidate JSON-ish search endpoints (not guaranteed; we probe a few common ones)
-# NOTE: these are *heuristics*, because PeopleAdmin tenant implementations vary.
-JSON_SEARCH_TEMPLATES = [
-    # If you discover a consistent real endpoint for a tenant, add it here.
-    "{base}/postings/search.json?{qs}",
-    "{base}/postings/search.json?{qs}&format=json",
-    "{base}/postings/search?{qs}&format=json",
-    "{base}/postings/search?{qs}&output=1&format=json",
-    # sometimes adding these headers to the normal search can return JSON-ish output
-    "{base}/postings/search?{qs}",
-]
+PRINT_LOCK = Lock()
+_TLS = local()
+
+
+# -----------------------------
+# Session / retries
+# -----------------------------
+
+def make_session(timeout_hint: float = 12.0) -> requests.Session:
+    """
+    Create a requests.Session with retries and decent connection pooling.
+    """
+    s = requests.Session()
+    s.headers.update(DEFAULT_HEADERS)
+
+    retry = Retry(
+        total=4,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+
+    # Pool sizes are important under concurrency
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=100,
+        pool_maxsize=100,
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
+def get_thread_session() -> requests.Session:
+    """
+    Thread-local session to avoid sharing a single Session across threads.
+    """
+    s = getattr(_TLS, "session", None)
+    if s is None:
+        s = make_session()
+        _TLS.session = s
+    return s
 
 
 # -----------------------------
@@ -265,39 +288,12 @@ def build_search_url(base_url: str, query: str, page: int) -> str:
     params = {"page": page, "query": query}
     return f"{base_url.rstrip('/')}{path}?{urlencode(params)}"
 
-def fetch(session: requests.Session, url: str, timeout: float, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[requests.Response], Optional[str]]:
+def fetch(session: requests.Session, url: str, timeout: float) -> Tuple[Optional[requests.Response], Optional[str]]:
     try:
-        resp = session.get(url, timeout=timeout, allow_redirects=True, headers=headers)
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
         return resp, None
     except requests.RequestException as e:
         return None, str(e)
-
-def try_parse_json(resp: requests.Response) -> Optional[Any]:
-    """
-    Attempt to parse a response as JSON safely.
-    Returns parsed object or None.
-    """
-    if resp is None:
-        return None
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    text = resp.text or ""
-
-    # Strong signals
-    if "application/json" in ct:
-        try:
-            return resp.json()
-        except Exception:
-            return None
-
-    # Weak signals
-    t = text.lstrip()
-    if t.startswith("{") or t.startswith("["):
-        try:
-            return resp.json()
-        except Exception:
-            return None
-
-    return None
 
 def candidate_bases_for_domain(domain: str) -> List[str]:
     d = normalize_domain(domain)
@@ -314,22 +310,6 @@ def candidate_bases_for_domain(domain: str) -> List[str]:
             out.append(b)
             seen.add(b)
     return out
-
-def posting_print_preview_url(posting_url: str) -> str:
-    """
-    Prefer the print preview variant: /postings/<id>/print_preview
-    """
-    # If already has print_preview, keep it
-    if posting_url.endswith("/print_preview"):
-        return posting_url
-
-    # Ensure it's /postings/<id>...
-    m = re.search(r"(.*?/postings/\d+)", posting_url)
-    if m:
-        return m.group(1) + "/print_preview"
-
-    # fallback: append
-    return posting_url.rstrip("/") + "/print_preview"
 
 
 # -----------------------------
@@ -357,155 +337,13 @@ def choose_working_base(session: requests.Session, domain: str, query: str, time
             parsed = urlparse(final_url)
             return f"{parsed.scheme}://{parsed.netloc}"
 
-        polite_sleep(0.05, 0.2)
+        polite_sleep(0.02, 0.10)
 
     return None
 
 
 # -----------------------------
-# Search via JSON-ish endpoints (best effort)
-# -----------------------------
-
-def extract_postings_from_search_json(
-    obj: Any,
-    base_url: str,
-    school_input: str,
-    query: str,
-) -> List[Posting]:
-    """
-    Robust-ish extractor:
-    - Walk arbitrary JSON structure
-    - Find strings that look like /postings/<digits>
-    - Build Posting objects
-    """
-    postings: List[Posting] = []
-    seen_ids: Set[str] = set()
-
-    # Heuristic title keys commonly seen across job payloads
-    TITLE_KEYS = {"title", "position_title", "working_title", "job_title", "name"}
-    LOCATION_KEYS = {"location", "campus", "city", "work_location"}
-    DEPT_KEYS = {"department", "dept", "division", "unit"}
-
-    def find_posting_url_in_value(v: Any) -> Optional[str]:
-        if isinstance(v, str):
-            m = re.search(r"(/postings/\d+)", v)
-            if m:
-                return m.group(1)
-        return None
-
-    def walk(node: Any, context: Optional[Dict[str, Any]] = None) -> None:
-        if isinstance(node, dict):
-            # If this dict itself contains a postings link anywhere, treat as a candidate record.
-            posting_path = None
-            for vv in node.values():
-                p = find_posting_url_in_value(vv)
-                if p:
-                    posting_path = p
-                    break
-
-            if posting_path:
-                m = re.search(r"/postings/(\d+)", posting_path)
-                pid = m.group(1) if m else None
-                if pid and pid in seen_ids:
-                    return
-
-                # Title: try direct keys first
-                title = None
-                for k in node.keys():
-                    lk = str(k).lower()
-                    if lk in TITLE_KEYS:
-                        title = clean_text(str(node.get(k) or ""))
-                        if title:
-                            break
-
-                if not title and context:
-                    for k in context.keys():
-                        lk = str(k).lower()
-                        if lk in TITLE_KEYS:
-                            title = clean_text(str(context.get(k) or ""))
-                            if title:
-                                break
-
-                title = title or (f"Posting {pid}" if pid else "Posting")
-
-                # Location/Dept (best effort)
-                location = None
-                department = None
-
-                for k, v in node.items():
-                    lk = str(k).lower()
-                    if not location and lk in LOCATION_KEYS:
-                        location = clean_text(str(v or ""))
-                    if not department and lk in DEPT_KEYS:
-                        department = clean_text(str(v or ""))
-
-                abs_url = urljoin(base_url, posting_path)
-                postings.append(
-                    Posting(
-                        school_input=school_input,
-                        base_url=base_url,
-                        query=query,
-                        title=title,
-                        url=abs_url,
-                        location=location or None,
-                        department=department or None,
-                        posting_id=pid,
-                        search_mode="json",
-                    )
-                )
-                if pid:
-                    seen_ids.add(pid)
-
-            # Continue walking
-            for k, v in node.items():
-                walk(v, context=node)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item, context=context)
-
-    walk(obj)
-
-    return postings
-
-def try_fetch_search_json(
-    session: requests.Session,
-    base_url: str,
-    query: str,
-    page: int,
-    timeout: float,
-) -> Tuple[Optional[List[Posting]], Optional[str]]:
-    """
-    Probe a handful of likely JSON-ish endpoints and return postings if we get JSON.
-    Returns (postings, endpoint_used)
-    """
-    qs = urlencode({"page": page, "query": query})
-
-    for tmpl in JSON_SEARCH_TEMPLATES:
-        url = tmpl.format(base=base_url.rstrip("/"), qs=qs)
-
-        # For the "plain /postings/search?..." template, use XHR-ish headers
-        hdrs = XHR_HEADERS if "/postings/search?" in url and not url.endswith(".json") else None
-
-        resp, _err = fetch(session, url, timeout=timeout, headers=hdrs)
-        if resp is None:
-            continue
-        if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
-            continue
-
-        obj = try_parse_json(resp)
-        if obj is None:
-            continue
-
-        postings = extract_postings_from_search_json(obj, base_url=base_url, school_input=base_url, query=query)
-        # Note: school_input will be overwritten by caller; here just to satisfy signature
-        if postings:
-            return postings, url
-
-    return None, None
-
-
-# -----------------------------
-# Search page parsing (HTML fallback)
+# Search page parsing
 # -----------------------------
 
 def extract_postings_from_search_html(
@@ -576,7 +414,6 @@ def extract_postings_from_search_html(
                 location=location,
                 department=department,
                 posting_id=posting_id,
-                search_mode="html",
             )
         )
 
@@ -637,22 +474,33 @@ def extract_kv_from_label_value_blocks(soup: BeautifulSoup) -> Dict[str, str]:
                 out[k] = v
     return out
 
-def scrape_detail_html(
-    html: str,
+def scrape_detail_page(
+    session: requests.Session,
     posting: Posting,
+    timeout: float,
     store_html: bool,
 ) -> Posting:
+    resp, _err = fetch(session, posting.url, timeout=timeout)
+    if resp is None:
+        return posting
+    if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
+        return posting
+
+    html = resp.text or ""
     soup = BeautifulSoup(html, "html.parser")
 
+    # Store whole page content
     if store_html:
         posting.detail_html = html
     posting.detail_text = extract_visible_text(soup)
 
+    # Gather raw key/value pairs from multiple structures
     kv: Dict[str, str] = {}
     kv.update(extract_kv_from_dt_dd(soup))
     kv.update(extract_kv_from_tables(soup))
     kv.update(extract_kv_from_label_value_blocks(soup))
 
+    # Map into canonical fields
     for raw_k, raw_v in kv.items():
         canon = LABEL_MAP.get(raw_k)
         if not canon:
@@ -667,14 +515,16 @@ def scrape_detail_html(
         if getattr(posting, canon, None) in (None, ""):
             setattr(posting, canon, raw_v)
 
+    # Last-resort salary range detection from text (if no labeled salary found)
     if not posting.salary and posting.detail_text:
         m = re.search(
             r"(\$[\d,]+(?:\.\d{1,2})?)\s*(?:-|to)\s*(\$[\d,]+(?:\.\d{1,2})?)",
-            posting.detail_text
+            posting.detail_text,
         )
         if m:
             posting.salary = f"{m.group(1)} - {m.group(2)}"
 
+    # Normalize min/max from the salary string (smallest / largest $ amount found)
     if posting.salary:
         mn, mx = extract_salary_numbers(posting.salary)
         if mn and not posting.salary_min:
@@ -684,34 +534,16 @@ def scrape_detail_html(
 
     return posting
 
-def scrape_detail_page(
-    session: requests.Session,
-    posting: Posting,
-    timeout: float,
-    store_html: bool,
-) -> Posting:
-    """
-    Try print_preview first (usually simpler), fall back to normal page.
-    """
-    candidate_urls = [posting_print_preview_url(posting.url), posting.url]
-    for u in candidate_urls:
-        resp, _err = fetch(session, u, timeout=timeout)
-        if resp is None:
-            continue
-        if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
-            continue
-        html = resp.text or ""
-        return scrape_detail_html(html=html, posting=posting, store_html=store_html)
-
-    return posting
-
 
 # -----------------------------
 # School scrape (search + optional details)
 # -----------------------------
 
+def _safe_print(*args, **kwargs) -> None:
+    with PRINT_LOCK:
+        print(*args, **kwargs)
+
 def scrape_school(
-    session: requests.Session,
     school_input: str,
     domain: str,
     query: str,
@@ -721,8 +553,13 @@ def scrape_school(
     max_delay: float,
     details: bool,
     store_html: bool,
-    prefer_json: bool,
+    detail_workers: int,
 ) -> Tuple[List[Posting], Optional[str]]:
+    """
+    Runs in a worker thread for one school. Uses that thread's session for search/base discovery.
+    """
+    session = get_thread_session()
+
     base = choose_working_base(session, domain=domain, query=query, timeout=timeout)
     if not base:
         return [], None
@@ -731,71 +568,69 @@ def scrape_school(
     seen_posting_ids: Set[str] = set()
 
     for page in range(1, max_pages + 1):
+        _safe_print(school_input, "| Page", page)
 
-        print(school_input, "| Page", page)
+        url = build_search_url(base, query=query, page=page)
+        resp, _err = fetch(session, url, timeout=timeout)
+        if resp is None:
+            break
+
+        if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
+            break
+
+        html = resp.text or ""
+        if not is_likely_peopleadmin(html, str(resp.url)):
+            break
+
+        postings = extract_postings_from_search_html(html, base_url=base, school_input=school_input, query=query)
 
         new_postings: List[Posting] = []
-
-        # 1) Try JSON-ish search
-        if prefer_json:
-            json_postings, endpoint = try_fetch_search_json(
-                session=session,
-                base_url=base,
-                query=query,
-                page=page,
-                timeout=timeout,
-            )
-            if json_postings:
-                # Repair fields and de-dupe
-                for p in json_postings:
-                    p.school_input = school_input
-                    p.base_url = base
-                    p.query = query
-                    p.search_endpoint = endpoint
-
-                    if p.posting_id and p.posting_id in seen_posting_ids:
-                        continue
-                    if p.posting_id:
-                        seen_posting_ids.add(p.posting_id)
-                    all_postings.append(p)
-                    new_postings.append(p)
-
-        # 2) Fallback to HTML search if JSON yielded nothing
-        if not new_postings:
-            url = build_search_url(base, query=query, page=page)
-            resp, _err = fetch(session, url, timeout=timeout)
-            if resp is None:
-                break
-
-            if resp.status_code in (401, 403, 404, 429) or resp.status_code >= 500:
-                break
-
-            html = resp.text or ""
-            if not is_likely_peopleadmin(html, str(resp.url)):
-                break
-
-            postings = extract_postings_from_search_html(html, base_url=base, school_input=school_input, query=query)
-            for p in postings:
-                if p.posting_id and p.posting_id in seen_posting_ids:
-                    continue
-                if p.posting_id:
-                    seen_posting_ids.add(p.posting_id)
-                all_postings.append(p)
-                new_postings.append(p)
+        for p in postings:
+            if p.posting_id and p.posting_id in seen_posting_ids:
+                continue
+            if p.posting_id:
+                seen_posting_ids.add(p.posting_id)
+            all_postings.append(p)
+            new_postings.append(p)
 
         if not new_postings:
             break
 
-        # details for the new postings from this page
-        if details:
-            for i in range(len(new_postings)):
+        if details and new_postings:
+            # Fast path: parallelize detail page scraping within this school.
+            # Use per-thread sessions inside the detail pool (thread-local).
+            def detail_worker(p: Posting) -> Posting:
+                # Small jitter so detail requests don't all burst at the same millisecond
                 polite_sleep(min_delay, max_delay)
-                new_postings[i] = scrape_detail_page(
-                    session=session,
-                    posting=new_postings[i],
+                s = get_thread_session()
+                return scrape_detail_page(
+                    session=s,
+                    posting=p,
                     timeout=timeout,
                     store_html=store_html,
                 )
+
+            # Cap at least 1
+            dw = max(1, int(detail_workers))
+            with ThreadPoolExecutor(max_workers=dw) as ex:
+                futs = [ex.submit(detail_worker, p) for p in new_postings]
+
+                detailed_results: List[Posting] = []
+                for f in as_completed(futs):
+                    try:
+                        detailed_results.append(f.result())
+                    except Exception as e:
+                        # Best-effort: keep going; return original posting if something went wrong
+                        _safe_print("Detail worker error:", repr(e))
+                        # Can't recover which posting; skip (rare)
+
+            # Re-stitch results back onto new_postings, preserving order when possible
+            detailed_by_id: Dict[str, Posting] = {
+                p.posting_id: p for p in detailed_results if p.posting_id
+            }
+            for idx, p in enumerate(new_postings):
+                if p.posting_id and p.posting_id in detailed_by_id:
+                    new_postings[idx] = detailed_by_id[p.posting_id]
 
         polite_sleep(min_delay, max_delay)
 
@@ -824,18 +659,19 @@ def read_inputs(path: str) -> List[str]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--inputs", required=True, help="Text file with one school domain per line (e.g., unc.edu)")
-    ap.add_argument("--query", default="data", help="Search query term (default: data)")
+    ap.add_argument("--query", default="", help='Search query term (default: "")')
     ap.add_argument("--max-pages", type=int, default=5, help="Max search pages to scrape per school")
     ap.add_argument("--timeout", type=float, default=12.0, help="HTTP timeout seconds")
     ap.add_argument("--min-delay", type=float, default=0.4, help="Min seconds between requests")
     ap.add_argument("--max-delay", type=float, default=1.1, help="Max seconds between requests")
     ap.add_argument("--details", action="store_true", help="Fetch each posting detail page for salary/dates/etc.")
     ap.add_argument("--store-html", action="store_true", help="Store raw detail HTML in output (large).")
-    ap.add_argument("--prefer-json", dest="prefer_json", action="store_true", default=True,
-                    help="Try JSON-ish endpoints for search before HTML (default: on)")
-    ap.add_argument("--no-prefer-json", dest="prefer_json", action="store_false",
-                    help="Disable JSON probing and use HTML search only")
     ap.add_argument("--out-jsonl", default="peopleadmin_results.jsonl", help="Output JSONL path")
+
+    # Parallelism
+    ap.add_argument("--workers", type=int, default=16, help="Parallel workers (schools)")
+    ap.add_argument("--detail-workers", type=int, default=6, help="Parallel workers (detail pages within a school)")
+
     args = ap.parse_args()
 
     inputs = read_inputs(args.inputs)
@@ -843,43 +679,63 @@ def main() -> int:
         print("No inputs found.", file=sys.stderr)
         return 2
 
-    session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
-
     total = 0
     schools_with_hits = 0
 
+    # Parallelize schools; write JSONL from main thread (simple + safe)
     with open(args.out_jsonl, "w", encoding="utf-8") as out:
-        for raw in inputs:
-            domain = normalize_domain(raw)
+        with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as ex:
+            futures = []
+            for raw in inputs:
+                domain = normalize_domain(raw)
+                futures.append(
+                    ex.submit(
+                        scrape_school,
+                        raw,
+                        domain,
+                        args.query,
+                        args.max_pages,
+                        args.timeout,
+                        args.min_delay,
+                        args.max_delay,
+                        args.details,
+                        args.store_html,
+                        args.detail_workers,
+                    )
+                )
 
-            postings, base_used = scrape_school(
-                session=session,
-                school_input=raw,
-                domain=domain,
-                query=args.query,
-                max_pages=args.max_pages,
-                timeout=args.timeout,
-                min_delay=args.min_delay,
-                max_delay=args.max_delay,
-                details=args.details,
-                store_html=args.store_html,
-                prefer_json=args.prefer_json,
-            )
+            for (raw, fut) in zip(inputs, futures):
+                # Don't use `zip` order for results; we want completion order for speed / responsiveness.
+                # We'll ignore this `zip` and iterate with as_completed below.
+                pass
 
-            if postings:
-                schools_with_hits += 1
+            # Process in completion order
+            for fut in as_completed(futures):
+                try:
+                    postings, base_used = fut.result()
+                except Exception as e:
+                    with PRINT_LOCK:
+                        print("School worker error:", repr(e), file=sys.stderr)
+                    continue
 
-            for p in postings:
-                out.write(json.dumps(asdict(p), ensure_ascii=False) + "\n")
+                # We don't know which raw domain from fut unless we wrap it; so print base only here.
+                # If you want the raw printed reliably, wrap futures with a tuple like in the earlier suggestion.
+                # For now, each scrape_school prints page progress using school_input.
 
-            total += len(postings)
-            base_disp = base_used or ""
-            mode_counts = {}
-            for p in postings:
-                mode_counts[p.search_mode or "unknown"] = mode_counts.get(p.search_mode or "unknown", 0) + 1
-            mode_disp = ", ".join([f"{k}:{v}" for k, v in mode_counts.items()]) if mode_counts else ""
-            print(f"{raw:30s} -> {len(postings):4d} postings  {base_disp}  [{mode_disp}]")
+                if postings:
+                    schools_with_hits += 1
+
+                for p in postings:
+                    out.write(json.dumps(asdict(p), ensure_ascii=False) + "\n")
+
+                total += len(postings)
+                base_disp = base_used or ""
+                if postings:
+                    _safe_print(f"{postings[0].school_input:30s} -> {len(postings):4d} postings  {base_disp}")
+                else:
+                    # Can't reliably show school_input if base discovery failed before any postings were created;
+                    # progress printing still happened in scrape_school, so this is fine.
+                    _safe_print(f"{'(no postings)':30s} -> {len(postings):4d} postings  {base_disp}")
 
     print("\nDone.")
     print(f"Schools checked: {len(inputs)}")
