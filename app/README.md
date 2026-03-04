@@ -19,9 +19,10 @@ python -m pip install --upgrade pip
 pip install pandas requests flask sqlalchemy pymysql beautifulsoup4 feedparser python-dotenv psycopg2-binary
 ```
 
-
-
-
+## Run Locally
+```
+flask run
+```
 
 ## Run It (on Linux / Remote)
 
