@@ -25,53 +25,67 @@ def jobs():
 
 
 
-@bp.route('/__setup', strict_slashes=False)
+@bp.route('/setup', strict_slashes=False)
 def setup():
     access = jetTools.checkAccess()
     if not access["isAdmin"]:
         return "Admin only."
     jetTools.pgQuery("""
-        CREATE TABLE IF NOT EXISTS asset_groups (
+        CREATE TABLE IF NOT EXISTS peopleadmin_postings (
             id BIGSERIAL PRIMARY KEY,
-            owner_id INT DEFAULT 0,
-            label TEXT
+
+            -- identity / provenance
+            school_input TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            query TEXT NOT NULL DEFAULT '',
+
+            posting_id TEXT,
+            url TEXT NOT NULL,
+
+            -- summary fields
+            title TEXT NOT NULL,
+            location TEXT,
+            department TEXT,
+
+            -- detail fields (raw)
+            salary TEXT,
+            salary_min TEXT,
+            salary_max TEXT,
+
+            -- detail fields (numeric for analytics)
+            salary_min_num NUMERIC(12,2),
+            salary_max_num NUMERIC(12,2),
+
+            posted_date DATE,
+            close_date DATE,
+            open_until_filled BOOLEAN,
+
+            employment_type TEXT,
+            time_limit TEXT,
+            full_time_or_part_time TEXT,
+            special_instructions TEXT,
+
+            -- full page capture
+            detail_text TEXT,
+            detail_html TEXT,
+
+            -- metadata
+            scraped_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+            CONSTRAINT uq_peopleadmin_posting UNIQUE (base_url, posting_id)
         );
     """)
     jetTools.pgQuery("""
-        CREATE TABLE IF NOT EXISTS asset_types (
-            id BIGSERIAL PRIMARY KEY,
-            owner_id INT DEFAULT 0,
-            label TEXT,
-            fields jsonb
-        );
+        CREATE INDEX IF NOT EXISTS idx_peopleadmin_school_input
+            ON peopleadmin_postings (school_input);
     """)
     jetTools.pgQuery("""
-        CREATE TABLE IF NOT EXISTS field_types (
-            id BIGSERIAL PRIMARY KEY,
-            owner_id INT DEFAULT 0,
-            label TEXT,
-            inputtype TEXT,
-            options jsonb
-        );
+        CREATE INDEX IF NOT EXISTS idx_peopleadmin_posted_date
+            ON peopleadmin_postings (posted_date);
     """)
     jetTools.pgQuery("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            id BIGSERIAL PRIMARY KEY,
-            owner_id INT DEFAULT 0,
-            custom_id TEXT,
-            label TEXT,
-            asset_group_id INT DEFAULT 0,
-            asset_type_id INT DEFAULT 0,
-            fields jsonb
-        );
-    """)
-    jetTools.pgQuery("""
-        CREATE TABLE IF NOT EXISTS asset_values (
-            id BIGSERIAL PRIMARY KEY,
-            asset_id TEXT,
-            field text,
-            value text
-        );
+        CREATE INDEX IF NOT EXISTS idx_peopleadmin_close_date
+            ON peopleadmin_postings (close_date);
     """)
     return "Done."
 
