@@ -7,5 +7,5 @@
  - scraper4.py* - Sped up more
 
  - sandbox1.py - grab Names and URLs from IPEDS summary table
- - sandbox2.py - 
+ - sandbox2.py - semi-automatic manual checks with popup windows
  - sandbox3.py - 
