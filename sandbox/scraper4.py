@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 
-> python scraper4.py --inputs peopleadmin_sites.txt --query data --details --workers 12 --detail-workers 8 --max-pages 5
+> python scraper4.py --inputs schools_test.txt --query data --details --workers 12 --detail-workers 8 --max-pages 5
 
 Scrape job postings from PeopleAdmin installations (common at colleges).
 

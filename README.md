@@ -8,7 +8,8 @@ https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx
  - scraper1.py - Scrapes like I want, but slow
  - scraper2.py - Parallelized
  - scraper3.py - Sped up
- - scraper4.py* - Sped up more
+ - scraper4.py - Sped up more
+ - scraper4.py* - Better ctrl+c cancellation
 
  - sandbox1.py - grab Names and URLs from IPEDS summary table
  - sandbox2.py - semi-automatic manual checks with popup windows
