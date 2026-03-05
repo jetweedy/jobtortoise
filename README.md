@@ -1,5 +1,9 @@
 # College Job Scrapers
 
+## IPEDS Data:
+
+https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx
+
 ## Files
  - scraper1.py - Scrapes like I want, but slow
  - scraper2.py - Parallelized
