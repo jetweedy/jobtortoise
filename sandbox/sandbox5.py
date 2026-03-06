@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 """
-sandbox5.py
+detect_job_systems.py
 
-Read schools.txt (one school domain per line, e.g. unc.edu), probe likely
-career/job URLs, and classify the institution's job posting system.
+Detect likely university job-posting systems by probing ONLY school-specific URLs
+and following redirects. This version does NOT assume any vendor homepage or
+generic vendor URL belongs to a school.
+
+Input:
+  schools.txt   one school domain per line, e.g.
+      unc.edu
+      uncg.edu
+      ncsu.edu
 
 Outputs:
-  1) job_systems.json
-  2) job_systems.csv
-
-Fields:
-  - school
-  - system
-  - confidence
-  - matched_pattern
-  - matched_url
-  - notes
+  - job_systems.json
+  - job_systems.csv
 
 Usage:
-  python sandbox5.py
-  python sandbox5.py --inputs schools.txt --workers 20 --timeout 12
+  python detect_job_systems.py
+  python detect_job_systems.py --inputs schools.txt --workers 20 --timeout 10
 
 Dependencies:
   pip install requests beautifulsoup4
 
-This is intentionally heuristic. It aims for:
-  - strong URL/domain matches first
-  - then page text / HTML fallback
-  - sensible confidence scoring
+Notes:
+  - This is intentionally conservative.
+  - It only classifies a school when evidence comes from:
+      1) a school-domain page,
+      2) a redirect from a school-domain page to a vendor domain, or
+      3) a school-specific vendor hostname/path derived from the school.
+  - It avoids generic vendor homepages like apply.interfolio.com with no school-specific context.
 """
 
 from __future__ import annotations
@@ -41,7 +43,8 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -59,31 +62,6 @@ def handle_sigint(sig, frame):
 signal.signal(signal.SIGINT, handle_sigint)
 
 
-@dataclass
-class DetectionResult:
-    school: str
-    system: Optional[str]
-    confidence: float
-    matched_pattern: Optional[str]
-    matched_url: Optional[str]
-    notes: Optional[str]
-
-
-COMMON_PATHS = [
-    "",
-    "/jobs",
-    "/employment",
-    "/careers",
-    "/hr",
-    "/about/jobs",
-    "/about/employment",
-    "/faculty-staff/jobs",
-    "/human-resources",
-    "/human-resources/careers",
-    "/jobs/openings",
-    "/postings/search",
-]
-
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -94,6 +72,39 @@ HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+COMMON_PATHS = [
+    "",
+    "/jobs",
+    "/job",
+    "/jobs/",
+    "/employment",
+    "/employment/",
+    "/careers",
+    "/careers/",
+    "/human-resources",
+    "/human-resources/",
+    "/human-resources/careers",
+    "/human-resources/employment",
+    "/hr",
+    "/hr/",
+    "/about/jobs",
+    "/about/employment",
+    "/faculty-staff/jobs",
+    "/faculty-staff/employment",
+    "/postings/search",
+]
+
+
+@dataclass
+class DetectionResult:
+    school: str
+    system: Optional[str]
+    confidence: float
+    matched_pattern: Optional[str]
+    matched_url: Optional[str]
+    source_url: Optional[str]
+    notes: Optional[str]
 
 
 def normalize_school(line: str) -> Optional[str]:
@@ -107,10 +118,27 @@ def normalize_school(line: str) -> Optional[str]:
     return s or None
 
 
-def build_candidate_urls(school: str) -> List[str]:
-    urls = []
+def school_tokens(school: str) -> List[str]:
+    """
+    uncg.edu -> ['uncg']
+    appstate.edu -> ['appstate']
+    something.foo.edu -> ['something', 'foo']
+    """
+    host = school.lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    parts = [p for p in host.split(".") if p and p not in {"edu", "org", "com", "net"}]
+    return parts
 
-    # Direct school-domain possibilities
+
+def build_candidate_urls(school: str) -> List[str]:
+    """
+    Only school-specific candidate URLs.
+    Avoid generic vendor URLs.
+    """
+    tokens = school_tokens(school)
+    first = tokens[0] if tokens else school.split(".")[0]
+
     bases = [
         f"https://{school}",
         f"http://{school}",
@@ -122,40 +150,46 @@ def build_candidate_urls(school: str) -> List[str]:
         f"http://employment.{school}",
         f"https://careers.{school}",
         f"http://careers.{school}",
+        f"https://hr.{school}",
+        f"http://hr.{school}",
+    ]
+
+    # Only school-specific vendor guesses. No generic vendor homepages.
+    school_specific_vendor_guesses = [
+        f"https://{first}.peopleadmin.com",
+        f"https://{first}.peopleadmin.com/postings/search",
+        f"https://{first}.wd1.myworkdayjobs.com",
+        f"https://{first}.wd5.myworkdayjobs.com",
     ]
 
     seen = set()
+    urls: List[str] = []
+
     for base in bases:
-        if base not in seen:
-            urls.append(base)
-            seen.add(base)
         for path in COMMON_PATHS:
             full = base.rstrip("/") + path
             if full not in seen:
-                urls.append(full)
                 seen.add(full)
+                urls.append(full)
 
-    # Higher-ed ATS-specific common vendor host patterns
-    vendor_guesses = [
-        f"https://{school.split('.')[0]}.peopleadmin.com",
-        f"https://{school.split('.')[0]}.peopleadmin.com/postings/search",
-        f"https://careers.pageuppeople.com",
-        f"https://apply.interfolio.com",
-    ]
-    for v in vendor_guesses:
-        if v not in seen:
-            urls.append(v)
-            seen.add(v)
+    for url in school_specific_vendor_guesses:
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
 
     return urls
 
 
-def fetch_url(session: requests.Session, url: str, timeout: int) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def fetch_url(
+    session: requests.Session,
+    source_url: str,
+    timeout: int,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Returns: final_url, html, error
     """
     try:
-        r = session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        r = session.get(source_url, headers=HEADERS, timeout=timeout, allow_redirects=True)
         ct = (r.headers.get("Content-Type") or "").lower()
 
         if r.status_code >= 400:
@@ -176,220 +210,394 @@ def extract_visible_text(html: str) -> str:
     return " ".join(soup.stripped_strings).lower()
 
 
-def score_match(system: str, pattern: str, url: str, text: str, html: str) -> float:
-    u = (url or "").lower()
-    t = text.lower()
-    h = html.lower()
-
-    score = 0.0
-
-    if system == "PeopleAdmin":
-        if "peopleadmin.com" in u:
-            score += 0.75
-        if "/postings/search" in u:
-            score += 0.75
-        if "search postings" in t:
-            score += 0.20
-        if "all jobs atom feed" in t:
-            score += 0.20
-        if "view all open postings below" in t:
-            score += 0.15
-
-    elif system == "PageUp":
-        if "pageuppeople.com" in u:
-            score += 0.80
-        if "/cw/en-us/listing" in u or "/en/listing" in u:
-            score += 0.60
-        if "recent jobs" in t:
-            score += 0.20
-
-    elif system == "Workday":
-        if "myworkdayjobs.com" in u:
-            score += 0.85
-        if "search for jobs" in t:
-            score += 0.20
-        if "jobs found" in t:
-            score += 0.15
-        if "jump to selected job details" in t:
-            score += 0.15
-        if '"externalcareer"' in h or '"jobpostinginfo"' in h:
-            score += 0.15
-
-    elif system == "Interfolio":
-        if "apply.interfolio.com" in u or "account.interfolio.com" in u:
-            score += 0.85
-        if "faculty search" in t:
-            score += 0.15
-        if "interfolio" in t:
-            score += 0.15
-
-    elif system == "NEOGOV/NeoEd":
-        if "governmentjobs.com" in u:
-            score += 0.85
-        if "neoed.com" in u:
-            score += 0.75
-        if "schooljobs" in t:
-            score += 0.15
-        if "governmentjobs" in t:
-            score += 0.15
-
-    elif system == "Taleo":
-        if "taleo.net" in u:
-            score += 0.90
-        if "oracle" in t and "taleo" in t:
-            score += 0.10
-
-    elif system == "iCIMS":
-        if "icims.com" in u:
-            score += 0.90
-        if "icims" in t:
-            score += 0.10
-
-    elif system == "SmartRecruiters":
-        if "smartrecruiters.com" in u:
-            score += 0.90
-        if "smartrecruiters" in t:
-            score += 0.10
-
-    elif system == "UKG / UltiPro":
-        if "ultipro.com" in u or "ukg.com" in u:
-            score += 0.85
-        if "ultipro" in t or "ukg" in t:
-            score += 0.15
-
-    elif system == "Jobvite":
-        if "jobvite.com" in u:
-            score += 0.90
-        if "jobvite" in t:
-            score += 0.10
-
-    return min(score, 0.99)
+def host_of(url: Optional[str]) -> str:
+    if not url:
+        return ""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
-def detect_system_from_content(final_url: str, html: str) -> Tuple[Optional[str], Optional[str], float, Optional[str]]:
+def is_same_school_domain(host: str, school: str) -> bool:
+    """
+    True if host is the school domain or subdomain thereof.
+    """
+    host = (host or "").lower()
+    school = school.lower()
+    return host == school or host.endswith("." + school)
+
+
+def school_token_in_text_or_host(school: str, url: str, text: str) -> bool:
+    """
+    Conservative check for school-specific context on a vendor page.
+    """
+    tokens = school_tokens(school)
+    host = host_of(url)
+    combined = (host + " " + text).lower()
+
+    for token in tokens:
+        token = token.strip().lower()
+        if not token or len(token) < 3:
+            continue
+        if token in combined:
+            return True
+
+    # Also check root label like uncg from uncg.edu
+    root = school.split(".")[0].lower()
+    if len(root) >= 3 and root in combined:
+        return True
+
+    return False
+
+
+def allowed_vendor_context(school: str, source_url: str, final_url: str, text: str) -> bool:
+    """
+    We allow vendor classification only when:
+      - the final page is still on the school domain, OR
+      - the request started from the school domain and redirected to the vendor, OR
+      - the final vendor page contains school-specific context (token in host/text), OR
+      - the final vendor hostname itself is school-specific (e.g. unc.peopleadmin.com)
+    """
+    source_host = host_of(source_url)
+    final_host = host_of(final_url)
+
+    if is_same_school_domain(final_host, school):
+        return True
+
+    # Redirected from school domain to vendor/system page
+    if is_same_school_domain(source_host, school):
+        return True
+
+    # School-specific subdomain on vendor host
+    # e.g. unc.peopleadmin.com
+    root = school.split(".")[0].lower()
+    if root and final_host.startswith(root + "."):
+        return True
+
+    # Vendor page explicitly mentions school token(s)
+    if school_token_in_text_or_host(school, final_url, text):
+        return True
+
+    return False
+
+
+def detect_system_from_content(
+    school: str,
+    source_url: str,
+    final_url: str,
+    html: str,
+) -> Tuple[Optional[str], Optional[str], float, Optional[str]]:
+    """
+    Conservative ATS detection.
+    """
     u = (final_url or "").lower()
-    text = extract_visible_text(html)
     h = html.lower()
+    text = extract_visible_text(html)
 
-    checks = [
-        ("PeopleAdmin", "peopleadmin.com domain", lambda: "peopleadmin.com" in u),
-        ("PeopleAdmin", "/postings/search path", lambda: "/postings/search" in u),
-        ("PeopleAdmin", "Search Postings text", lambda: "search postings" in text),
-        ("PeopleAdmin", "All Jobs Atom Feed text", lambda: "all jobs atom feed" in text),
+    source_host = host_of(source_url)
+    final_host = host_of(final_url)
+    redirected = source_host != final_host
 
-        ("PageUp", "pageuppeople.com domain", lambda: "pageuppeople.com" in u),
-        ("PageUp", "PageUp listing path", lambda: "/cw/en-us/listing" in u or "/en/listing" in u),
-        ("PageUp", "Recent Jobs text", lambda: "recent jobs" in text),
+    candidates: List[Tuple[str, str, float, Optional[str]]] = []
 
-        ("Workday", "myworkdayjobs.com domain", lambda: "myworkdayjobs.com" in u),
-        ("Workday", "Search for Jobs text", lambda: "search for jobs" in text),
-        ("Workday", "Jobs Found text", lambda: "jobs found" in text),
-        ("Workday", "Workday JSON markers", lambda: '"externalcareer"' in h or '"jobpostinginfo"' in h),
+    def add(system: str, pattern: str, score: float, note: Optional[str] = None):
+        candidates.append((system, pattern, min(score, 0.99), note))
 
-        ("Interfolio", "apply.interfolio.com domain", lambda: "apply.interfolio.com" in u),
-        ("Interfolio", "account.interfolio.com domain", lambda: "account.interfolio.com" in u),
-        ("Interfolio", "Faculty Search text", lambda: "faculty search" in text),
+    # -----------------------
+    # PeopleAdmin
+    # -----------------------
+    if (
+        "peopleadmin.com" in final_host
+        or "/postings/search" in u
+        or "/postings/" in u
+        or "search postings" in text
+        or "all jobs atom feed" in text
+    ):
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "peopleadmin.com" in final_host:
+                score += 0.70
+            if "/postings/search" in u:
+                score += 0.55
+            if "/postings/" in u:
+                score += 0.15
+            if "search postings" in text:
+                score += 0.15
+            if "all jobs atom feed" in text:
+                score += 0.15
+            if redirected:
+                score += 0.05
+            add("PeopleAdmin", "peopleadmin fingerprint", score)
 
-        ("NEOGOV/NeoEd", "governmentjobs.com domain", lambda: "governmentjobs.com" in u),
-        ("NEOGOV/NeoEd", "neoed.com domain", lambda: "neoed.com" in u),
-        ("NEOGOV/NeoEd", "SchoolJobs text", lambda: "schooljobs" in text),
+    # -----------------------
+    # Workday
+    # -----------------------
+    if "myworkdayjobs.com" in final_host or "search for jobs" in text or "jobs found" in text:
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "myworkdayjobs.com" in final_host:
+                score += 0.80
+            if "search for jobs" in text:
+                score += 0.10
+            if "jobs found" in text:
+                score += 0.10
+            if '"externalcareer"' in h or '"jobpostinginfo"' in h:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("Workday", "workday fingerprint", score)
 
-        ("Taleo", "taleo.net domain", lambda: "taleo.net" in u),
-        ("iCIMS", "icims.com domain", lambda: "icims.com" in u),
-        ("SmartRecruiters", "smartrecruiters.com domain", lambda: "smartrecruiters.com" in u),
-        ("UKG / UltiPro", "ultipro.com domain", lambda: "ultipro.com" in u),
-        ("Jobvite", "jobvite.com domain", lambda: "jobvite.com" in u),
-    ]
+    # -----------------------
+    # PageUp
+    # -----------------------
+    if (
+        "pageuppeople.com" in final_host
+        or "/cw/en-us/listing" in u
+        or "/en/listing" in u
+        or "recent jobs" in text
+    ):
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "pageuppeople.com" in final_host:
+                score += 0.75
+            if "/cw/en-us/listing" in u or "/en/listing" in u:
+                score += 0.15
+            if "recent jobs" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("PageUp", "pageup fingerprint", score)
 
-    candidates = []
-    for system, pattern, fn in checks:
-        try:
-            if fn():
-                conf = score_match(system, pattern, final_url, text, html)
-                candidates.append((system, pattern, conf))
-        except Exception:
-            pass
+    # -----------------------
+    # Interfolio
+    # Require stronger evidence than just generic apply.interfolio.com
+    # -----------------------
+    interfolio_posting = re.search(r"apply\.interfolio\.com/\d+", u) is not None
+    if (
+        interfolio_posting
+        or "account.interfolio.com" in final_host
+        or "faculty search" in text
+        or "interfolio" in text
+    ):
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if interfolio_posting:
+                score += 0.70
+            if "account.interfolio.com" in final_host:
+                score += 0.40
+            if "faculty search" in text:
+                score += 0.15
+            if "interfolio" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+
+            # Penalize generic apply.interfolio.com root page
+            if final_host == "apply.interfolio.com" and not interfolio_posting:
+                score -= 0.40
+
+            if score >= 0.35:
+                add("Interfolio", "interfolio fingerprint", score)
+
+    # -----------------------
+    # NEOGOV / NeoEd
+    # -----------------------
+    if (
+        "governmentjobs.com" in final_host
+        or "neoed.com" in final_host
+        or "schooljobs" in text
+        or "governmentjobs" in text
+    ):
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "governmentjobs.com" in final_host:
+                score += 0.75
+            if "neoed.com" in final_host:
+                score += 0.70
+            if "schooljobs" in text:
+                score += 0.10
+            if "governmentjobs" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("NEOGOV/NeoEd", "neogov fingerprint", score)
+
+    # -----------------------
+    # Taleo
+    # -----------------------
+    if "taleo.net" in final_host or ("oracle" in text and "taleo" in text):
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "taleo.net" in final_host:
+                score += 0.85
+            if "oracle" in text and "taleo" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("Taleo", "taleo fingerprint", score)
+
+    # -----------------------
+    # iCIMS
+    # -----------------------
+    if "icims.com" in final_host or "icims" in text:
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "icims.com" in final_host:
+                score += 0.85
+            if "icims" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("iCIMS", "icims fingerprint", score)
+
+    # -----------------------
+    # SmartRecruiters
+    # -----------------------
+    if "smartrecruiters.com" in final_host or "smartrecruiters" in text:
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "smartrecruiters.com" in final_host:
+                score += 0.85
+            if "smartrecruiters" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("SmartRecruiters", "smartrecruiters fingerprint", score)
+
+    # -----------------------
+    # UKG / UltiPro
+    # -----------------------
+    if "ultipro.com" in final_host or "ukg.com" in final_host or "ultipro" in text or "ukg" in text:
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "ultipro.com" in final_host or "ukg.com" in final_host:
+                score += 0.80
+            if "ultipro" in text or "ukg" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("UKG / UltiPro", "ukg/ultipro fingerprint", score)
+
+    # -----------------------
+    # Jobvite
+    # -----------------------
+    if "jobvite.com" in final_host or "jobvite" in text:
+        if allowed_vendor_context(school, source_url, final_url, text):
+            score = 0.0
+            if "jobvite.com" in final_host:
+                score += 0.85
+            if "jobvite" in text:
+                score += 0.10
+            if redirected:
+                score += 0.05
+            add("Jobvite", "jobvite fingerprint", score)
 
     if not candidates:
         return None, None, 0.0, None
 
     candidates.sort(key=lambda x: x[2], reverse=True)
-    best_system, best_pattern, best_conf = candidates[0]
+    best_system, best_pattern, best_conf, best_note = candidates[0]
 
-    note = None
+    # Ambiguity note if another system scored nearly as high
     if len(candidates) > 1:
-        second = candidates[1]
-        if second[2] >= best_conf - 0.10 and second[0] != best_system:
-            note = f"Also matched {second[0]} via {second[1]}"
+        second_system, second_pattern, second_conf, _ = candidates[1]
+        if second_system != best_system and second_conf >= best_conf - 0.08:
+            note = f"Also matched {second_system} via {second_pattern}"
+            if best_note:
+                note = f"{best_note}; {note}"
+            best_note = note
 
-    return best_system, best_pattern, best_conf, note
+    return best_system, best_pattern, round(best_conf, 3), best_note
 
 
 def scan_school(school: str, timeout: int) -> DetectionResult:
     if STOP:
-        return DetectionResult(school, None, 0.0, None, None, "Stopped before scan")
+        return DetectionResult(
+            school=school,
+            system=None,
+            confidence=0.0,
+            matched_pattern=None,
+            matched_url=None,
+            source_url=None,
+            notes="Stopped before scan",
+        )
 
     session = requests.Session()
     session.headers.update(HEADERS)
 
     best: Optional[DetectionResult] = None
-    errors = []
+    errors: List[str] = []
     checked = 0
 
-    for url in build_candidate_urls(school):
+    for source_url in build_candidate_urls(school):
         if STOP:
             break
 
         checked += 1
-        final_url, html, err = fetch_url(session, url, timeout=timeout)
+        final_url, html, err = fetch_url(session, source_url, timeout=timeout)
+
         if err:
-            errors.append(f"{url} -> {err}")
+            errors.append(f"{source_url} -> {err}")
             continue
+
         if not final_url or not html:
             continue
 
-        system, pattern, conf, note = detect_system_from_content(final_url, html)
+        system, pattern, conf, note = detect_system_from_content(
+            school=school,
+            source_url=source_url,
+            final_url=final_url,
+            html=html,
+        )
+
         if system:
             result = DetectionResult(
                 school=school,
                 system=system,
-                confidence=round(conf, 3),
+                confidence=conf,
                 matched_pattern=pattern,
                 matched_url=final_url,
+                source_url=source_url,
                 notes=note,
             )
+
             if best is None or result.confidence > best.confidence:
                 best = result
-                if result.confidence >= 0.95:
-                    break
+
+            if result.confidence >= 0.95:
+                break
 
     if best:
         return best
 
     note = f"No known ATS fingerprint found after checking {checked} URLs"
     if errors:
-        note += f"; sample error: {errors[0][:200]}"
+        note += f"; sample error: {errors[0][:180]}"
     return DetectionResult(
         school=school,
         system=None,
         confidence=0.0,
         matched_pattern=None,
         matched_url=None,
+        source_url=None,
         notes=note,
     )
 
 
 def load_schools(path: str) -> List[str]:
-    schools = []
+    schools: List[str] = []
     seen = set()
+
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             school = normalize_school(line)
             if not school:
                 continue
             if school not in seen:
-                schools.append(school)
                 seen.add(school)
+                schools.append(school)
+
     return schools
 
 
@@ -408,6 +616,7 @@ def write_csv(path: str, rows: List[DetectionResult]) -> None:
                 "confidence",
                 "matched_pattern",
                 "matched_url",
+                "source_url",
                 "notes",
             ],
         )
@@ -416,11 +625,19 @@ def write_csv(path: str, rows: List[DetectionResult]) -> None:
             w.writerow(asdict(row))
 
 
-def main():
+def summarize(results: List[DetectionResult]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for r in results:
+        key = r.system or "Unknown"
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--inputs", default="schools.txt", help="Input file with one school domain per line")
     parser.add_argument("--workers", type=int, default=20, help="Parallel worker count")
-    parser.add_argument("--timeout", type=int, default=12, help="HTTP timeout per request")
+    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout per request")
     parser.add_argument("--json-out", default="job_systems.json", help="JSON output file")
     parser.add_argument("--csv-out", default="job_systems.csv", help="CSV output file")
     args = parser.parse_args()
@@ -435,14 +652,15 @@ def main():
     results: List[DetectionResult] = []
     lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_map = {
-            ex.submit(scan_school, school, args.timeout): school
+            executor.submit(scan_school, school, args.timeout): school
             for school in schools
         }
 
         for i, fut in enumerate(as_completed(future_map), start=1):
             school = future_map[fut]
+
             try:
                 result = fut.result()
             except Exception as e:
@@ -452,6 +670,7 @@ def main():
                     confidence=0.0,
                     matched_pattern=None,
                     matched_url=None,
+                    source_url=None,
                     notes=f"Unhandled error: {e}",
                 )
 
@@ -460,8 +679,7 @@ def main():
 
             label = result.system or "Unknown"
             print(
-                f"[{i}/{len(schools)}] {school:<35} -> {label:<18} "
-                f"conf={result.confidence:.3f}",
+                f"[{i}/{len(schools)}] {school:<35} -> {label:<18} conf={result.confidence:.3f}",
                 file=sys.stderr,
             )
 
@@ -469,16 +687,20 @@ def main():
                 break
 
     results.sort(key=lambda r: r.school)
+
     write_json(args.json_out, results)
     write_csv(args.csv_out, results)
 
-    found = sum(1 for r in results if r.system)
+    counts = summarize(results)
+    print("\nSummary:", file=sys.stderr)
+    for system, count in counts.items():
+        print(f"  {system:<18} {count}", file=sys.stderr)
+
     print(
-        f"\nDone. Detected known systems for {found}/{len(results)} schools.\n"
-        f"Wrote {args.json_out}\n"
-        f"Wrote {args.csv_out}",
+        f"\nWrote {args.json_out}\nWrote {args.csv_out}",
         file=sys.stderr,
     )
+
     return 0
 
 
