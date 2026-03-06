@@ -5,7 +5,6 @@
    <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"
        integrity="sha256-WBkoXOwTeyKclOHuWtc+i2uENFpDZ9YPdf5Hf+D7ewM="
        crossorigin=""></script>
-script> 
    <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
    <script src="https://code.jquery.com/ui/1.14.2/jquery-ui.min.js" integrity="sha256-mblSWfbYzaq/f+4akyMhE6XELCou4jbkgPv+JQPER2M=" crossorigin="anonymous"></script>
    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
@@ -37,16 +36,19 @@ We MUST define a height or the map will be 0px tall and not appear/
 </style>
 
 
+<!--
 <div id="info">
 <em>(This info block is movable.)</em>
-
 </div>
+<script type="text/javascript">$("#info").draggable();</script>
+-->
+
 <div id="map"></div>
 
 
 <script type="text/javascript">
 
-$("#info").draggable();
+
 
 //// Including the Leaflet script tags gives you access to the Leaflet 'L' variable, which contains all of the functionality for the library.
 //// We can make a map with it by handing the ID of the element that will contain it ('map'):
@@ -95,7 +97,7 @@ function loadSchools() {
       marker.bindTooltip(x.instnm+"<hr>"+x.addr+"<br />"+x.city+"<br />"+x.stabbr+"<br />"+x.zip
       ); //.openTooltip();
       var popupContent = document.createElement("div");
-      popupContent.innerHTML = x.school_name+"<hr>"+x.addr+"<br />"+x.city+"<br />"+x.stabbr+"<br />"+x.zip
+      popupContent.innerHTML = x.instnm+"<hr>"+x.addr+"<br />"+x.city+"<br />"+x.stabbr+"<br />"+x.zip
       marker.bindPopup(popupContent);
     }
   })
