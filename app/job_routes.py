@@ -22,8 +22,14 @@ def get_ipeds_schools():
     return jsonify(q)
 
 
-
-
+@bp.route('/update_hr_system', methods=['GET', 'POST'])
+@bp.route('/update_hr_system/', methods=['GET', 'POST'])
+def update_hr_system():
+    r = {};
+    unitid = str(request.form['unitid'])
+    hr_system = request.form['hr_system']
+    r = jetTools.pgQuery("UPDATE ipeds_schools SET hr_system = %s WHERE unitid = %s", (hr_system, unitid));
+    return jsonify(r);
 
 
 

@@ -36,12 +36,10 @@ We MUST define a height or the map will be 0px tall and not appear/
 </style>
 
 
-<!--
 <div id="info">
 <em>(This info block is movable.)</em>
 </div>
 <script type="text/javascript">$("#info").draggable();</script>
--->
 
 <div id="map"></div>
 
@@ -49,12 +47,29 @@ We MUST define a height or the map will be 0px tall and not appear/
 <script type="text/javascript">
 
 
+hr_systems = {
+  "":{},
+  "PeopleAdmin":{},
+  "Workday":{},
+  "PageUp":{},
+  "NEOGOV / NeoEd":{},
+  "Interfolio":{},
+  "Oracle Taleo":{},
+  "iCIMS":{},
+  "SmartRecruiters":{},
+  "UKG / UltiPro":{},
+  "Jobvite":{},
+  "Cornerstone":{},
+  "SuccessFactors":{},
+  "Unknown":{},
+}
+
 
 //// Including the Leaflet script tags gives you access to the Leaflet 'L' variable, which contains all of the functionality for the library.
 //// We can make a map with it by handing the ID of the element that will contain it ('map'):
 var map = L.map('map');
 //// Then we can set the lat/lng and the initial zoom:
-map.setView([39.39432496471273 , -94.87545601132823], 4);
+map.setView([35.91094558143209, -79.0510950932315], 13);
 //// And we can specify a tile layer, as well as a maximum possible zoom:
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 18
@@ -64,7 +79,7 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 map.on('click', function(e) {
     var lat = e.latlng.lat;
     var lng = e.latlng.lng;
-    console.log(lat, "," , lng);
+    console.log(lat, lng);
 });
 
 
@@ -73,16 +88,50 @@ map.createPane("schoolsPane");
 map.getPane("schoolsPane").style.zIndex = 400;
 
 
+function getEduDomain(webaddr) {
+  try {
+    // Ensure URL has a protocol so URL() can parse it
+    if (!/^https?:\/\//i.test(webaddr)) {
+      webaddr = "https://" + webaddr;
+    }
+    const host = new URL(webaddr).hostname;
+    const match = host.match(/([^.]+\.edu)$/i);
+    return match ? match[1] : null;
+  } catch (e) {
+    return null;
+  }
+}
 
+function googlify(x) {
+  return "https://www.google.com/search?q=" + encodeURIComponent(x);
+}
+
+var schoolData = {};
+function processSchoolData(schools) {
+  for (var school of schools) {
+    schoolData[school.unitid] = school;
+    //schoolData[school.unitid].hr_system = "";
+  }
+  //console.log(schoolData);
+  return schoolData;
+}
+
+circleMarkerColors = {
+  "empty":"white",
+  "changed":"lightgreen",
+  "complete":"gray",
+}
 
 function loadSchools() {
-  console.log("loadSchools()");
   $.get("/jobs/ipeds_schools", function(schools) {
-    console.log(schools);
-    console.log(typeof schools);
-    console.log(Array.isArray(schools));
+    schoolData = processSchoolData(schools);
     for (var x of schools) {
-      var mColor = "orange";
+      if (x.iclevel >2) { continue; }
+      var mColor = circleMarkerColors["complete"];
+      console.log(x.hr_system);
+      if (x.hr_system==null) {
+        mColor = circleMarkerColors["empty"];
+      }
       var oColor = "black";
       var mRadius = 5;
       var marker = L.circleMarker( [ x.latitude, x.longitud ] , {
@@ -94,11 +143,40 @@ function loadSchools() {
         fillOpacity: 1
       });
       marker.addTo(map);
-      marker.bindTooltip(x.instnm+"<hr>"+x.addr+"<br />"+x.city+"<br />"+x.stabbr+"<br />"+x.zip
-      ); //.openTooltip();
-      var popupContent = document.createElement("div");
-      popupContent.innerHTML = x.instnm+"<hr>"+x.addr+"<br />"+x.city+"<br />"+x.stabbr+"<br />"+x.zip
-      marker.bindPopup(popupContent);
+      var puc = x.instnm+"<hr>"+x.addr+"<br />"+x.city+"<br />"+x.stabbr+"<br />"+x.zip;
+      marker.bindTooltip(puc); //.openTooltip();
+      //var popupContent = document.createElement("div");
+      //popupContent.innerHTML = puc;
+      //marker.bindPopup(popupContent);
+      marker.on("click", function(x) {
+        var gtext = "Jobs at " + getEduDomain(x.webaddr);
+        var glink = googlify(gtext);
+        $("#info").html("");
+        $("#info").append($("<div>").html("<strong>"+x.instnm+"</strong><hr /><a href='"+x.webaddr+"' target='_blank'>"+x.webaddr+"</a><hr /><a href='"+glink+"' target='_blank'>"+gtext+"</a><hr />"));
+        var s = $("<select>");
+        for (var hrSys in hr_systems) {
+          var o = $("<option>", {
+            "text":hrSys,
+            "value":hrSys
+          });
+          s.append(o);
+        }
+        s.val(schoolData[x.unitid].hr_system);
+        s.on("change", function(el, id) {
+          console.log(el.val(), id);
+          $.post("/jobs/update_hr_system", {
+            "unitid":id, "hr_system":el.val()
+          }, function(x) {
+            console.log(x);
+          });
+          schoolData[id].hr_system = el.val();
+          this.setStyle({
+            fillColor: circleMarkerColors["changed"]
+          });
+        }.bind(marker, s, x.unitid));
+        $("#info").append(s);
+      }.bind(marker, x));
+
     }
   })
   .fail(function(xhr, status, error) {
