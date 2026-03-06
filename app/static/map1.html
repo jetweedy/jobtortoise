@@ -1,0 +1,509 @@
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css"
+       integrity="sha256-kLaT2GOSpHechhsozzB+flnD+zUyjE2LlfWPgU04xyI="
+       crossorigin=""/>
+  <!-- Make sure you put this AFTER Leaflet's CSS -->
+   <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"
+       integrity="sha256-WBkoXOwTeyKclOHuWtc+i2uENFpDZ9YPdf5Hf+D7ewM="
+       crossorigin=""></script>
+   <script src="https://unpkg.com/leaflet-tooltip@0.8.0/dist/leaflet-tooltip.js"></script> 
+   <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
+   <script src="https://code.jquery.com/ui/1.14.2/jquery-ui.min.js" integrity="sha256-mblSWfbYzaq/f+4akyMhE6XELCou4jbkgPv+JQPER2M=" crossorigin="anonymous"></script>
+   <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+
+<style>
+/*
+We MUST define a height or the map will be 0px tall and not appear/
+*/
+#map { height: 100%; }
+
+#info {
+  position:fixed;
+  height:200px;
+  top:20px;
+  right:20px;
+  width:250px;
+  border:2px solid black;
+  background-color:white;
+  padding:10px;
+  z-index:1000;
+  font-family:arial;
+  overflow-y: scroll;
+}
+#notable_areas a.item {
+  display:block;
+  margin:0px 5px 5px 10px;
+}
+
+</style>
+
+
+<div id="info">
+<em>(This info block is movable.)</em>
+<h3>Notable Areas</h3>
+<div id="notable_areas"></div>
+<h3>About this Map</h3>
+Black dots are potential hemp outlets found using the Google Places API.
+<br /><br />
+Red ones are within 500ft of a school's latlng.
+<br /><br />
+Orange ones are schools found using the Google Places API.
+<br /><br />
+Light blue regions are school (board) property boundaries fetched using some sort of black magic that ChatGPT came up with (but seems to work pretty well), and it does seem to have Summit County boundaries...)
+<br /><br />
+Right-click two points to draw a line and see the distance in feet.
+<br /><br />
+</div>
+<div id="map"></div>
+
+
+<script type="text/javascript">
+
+$("#info").draggable();
+
+//// Including the Leaflet script tags gives you access to the Leaflet 'L' variable, which contains all of the functionality for the library.
+//// We can make a map with it by handing the ID of the element that will contain it ('map'):
+var map = L.map('map');
+//// Then we can set the lat/lng and the initial zoom:
+map.setView([40.85569512701696, -82.32853889465333], 16);
+//// And we can specify a tile layer, as well as a maximum possible zoom:
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18
+}).addTo(map);
+//// (After creating that tile layer, we also add it to our map.)
+
+map.on('click', function(e) {
+    var lat = e.latlng.lat;
+    var lng = e.latlng.lng;
+    console.log(lat, "," , lng);
+});
+
+map.createPane("regionsPane");
+map.getPane("regionsPane").style.zIndex = 300;
+
+map.createPane("schoolsPane");
+map.getPane("schoolsPane").style.zIndex = 400;
+
+map.createPane("placesPane");
+map.getPane("placesPane").style.zIndex = 500;
+
+
+function drawOhio() {
+  fetch("./ohio_boundary.geojson")
+    .then(r => r.json())
+    .then(ohioGeoJson => {
+      const ohioLayer = L.geoJSON(ohioGeoJson, {
+        pane: "regionsPane",
+        style: {
+          color: "red",     // boundary line color
+          weight: 3,        // thickness
+          opacity: 1,
+          fill: false       // don't fill (just outline)
+        }
+      }).addTo(map);
+
+      // Optional: zoom map to boundary
+      //map.fitBounds(ohioLayer.getBounds());
+    })
+    .catch(err => console.error("Failed to load ohio_boundary.geojson:", err));
+}
+
+  /*
+  //// Try to draw counties:
+  function drawCounties() {
+    fetch("./counties.geojson")
+      .then(r => {
+        console.log("r:", r);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(fc => {
+        const counties = L.geoJSON(fc, {
+            pane: "regionsPane",
+            filter: f => f.properties.ste_name == "Ohio",
+            style: () => ({
+            color: '#aaaaaa',       // border color
+            fillColor: '#dddddd',   // interior color
+            weight: 1,
+            fillOpacity: 0.25
+          }),
+          onEachFeature: (feature, layer) => {
+            // adjust these fields based on what's in your GeoJSON properties
+            const countyName = feature.properties.coty_name || {};
+            layer.bindTooltip(
+              `<b>${countyName} County</b>`
+            );
+            //layer.on('click', function (e) {
+            //    map.flyTo(e.latlng, 12);
+            //});
+          }
+        }).addTo(map);
+      })
+      .catch(err => console.error("Failed to load GeoJSON:", err));
+  }
+  */
+
+
+  function drawParcelBuffers() {
+  // Load dissolved buffer
+  fetch("./dissolved_buffer_500ft.geojson")
+    .then(r => r.json())
+    .then(fc => {
+      const bufferLayer = L.geoJSON(fc, {
+        renderer: L.canvas(),
+        style: {
+          color: "#ff0000",
+          weight: 1,
+          fillColor: "#ff0000",
+          fillOpacity: 0.15
+        }
+      }).addTo(map);
+    });
+  }
+
+
+  function drawParcels() {
+
+    fetch("./ohio_school_parcels.geojson")
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(fc => {
+        // -----------------------------------
+        // DRAW ORIGINAL PARCELS (your code)
+        // -----------------------------------
+        const schoolParcels = L.geoJSON(fc, {
+          renderer: L.canvas(),   // IMPORTANT for performance
+          style: (feature) => {
+            const p = feature.properties || {};
+            const objectid = p.OBJECTID || "";
+            const isNear = parcelProximities.hasOwnProperty(objectid);
+            return {
+              pane: "regionsPane",
+              color: isNear ? 'blue' : 'blue',
+              fillColor: isNear ? '#ff9966' : 'lightblue',
+              weight: isNear ? 1 : 1,
+              fillOpacity: 0.50,
+            };
+          },
+          onEachFeature: (feature, layer) => {
+            const p = feature.properties || {};
+            const objectid = p.OBJECTID || "";
+            const owner = p.OWNER1 || "";
+            const owner2 = p.OWNER2 || "";
+            const county = p.COUNTY || "";
+            const pin = p.PIN || "";
+            layer.bindPopup(
+              `${objectid}<br />` +
+              `<b>${owner}</b>${owner2 ? "<br/>" + owner2 : ""}` +
+              `${county ? "<br/>County: " + county : ""}` +
+              `${pin ? "<br/>PIN: " + pin : ""}`
+            );
+            /*
+            layer.bindTooltip(
+              `${objectid}<br />` +
+              `<b>${owner}</b>${owner2 ? "<br/>" + owner2 : ""}` +
+              `${county ? "<br/>County: " + county : ""}` +
+              `${pin ? "<br/>PIN: " + pin : ""}`
+            );
+            */
+          }
+        }).addTo(map);
+
+        drawParcelBuffers();
+
+      })
+
+      .catch(err => console.error(err));
+
+  }
+
+
+
+  var parcelProximities = {};
+  function loadParcelProximities() {
+    fetch("./place_parcel_by_OBJECTID.json")
+      .then(r => r.json())
+      .then(r => {
+        parcelProximities = r;
+        console.log(parcelProximities);
+        drawParcels();
+      })
+      .catch(err => console.error("Failed to load Parcel Proximities:", err));
+
+  }
+
+
+/*
+function _old_loadSchools() {
+  $.get("ohio_schools_grid_all.json", function(x) {
+      //console.log(x);
+    for (var i=0;i<x.length;i++) {
+      //console.log(x[i]);
+      //console.log(x[i].name, x[i].lat, x[i].lng);
+      var nearestSchool = (x[i].nearest_school_distance_m*3.2808399).toFixed(1);
+      var mColor = "blue";
+      var mRadius = 1;
+      var marker = L.circleMarker( [ x[i].lat, x[i].lng ] , {
+        pane: "schoolsPane",
+        radius: mRadius,
+        color: mColor,      // outline color
+        weight: 1,
+        fillColor: mColor,  // fill color
+        fillOpacity: 1
+      });
+      marker.addTo(map);
+      marker.bindTooltip(x[i].name+"<hr>"
+        +x[i].formatted_address
+      ); //.openTooltip();
+      var popupContent = document.createElement("div");
+      popupContent.innerHTML = x[i].name+"<hr>"+x[i].formatted_address
+      marker.bindPopup(popupContent);
+      const placeName = x[i].name;
+    }
+    loadPlaces();
+  });
+}
+*/
+
+
+
+function loadSchools() {
+
+  $.get("ohio_schools_simple.json", function(x) {
+    for (var i=0;i<x.length;i++) {
+      var mColor = "orange";
+      var mRadius = 5;
+      var marker = L.circleMarker( [ x[i].lat, x[i].lng ] , {
+        pane: "schoolsPane",
+        radius: mRadius,
+        color: mColor,      // outline color
+        weight: 1,
+        fillColor: mColor,  // fill color
+        fillOpacity: 1
+      });
+      marker.addTo(map);
+      //console.log(x[i].school_name, x[i].address);
+      marker.bindTooltip(x[i].school_name+"<hr>"+x[i].address
+      ); //.openTooltip();
+      var popupContent = document.createElement("div");
+      popupContent.innerHTML = x[i].school_name+"<hr>"+x[i].address
+      marker.bindPopup(popupContent);
+    }
+  });
+
+}
+
+
+
+function addNotableArea(x) {
+  var d = $("<a>").addClass('item').attr("href","javascript:;").html(x.name+"<br />"+x.formatted_address);
+  d.on("click", () => {
+    map.panTo([x.lat, x.lng]);
+  });
+  $("#notable_areas").append(d);
+}
+
+
+function loadPlaces() {
+
+  //$.get("ohio_places_with_school_details_final_pruned_with_nearest_school_irn.json", function(x) {
+  $.get("ohio_places_with_nearest_school.json", function(x) {
+      //console.log(x);
+
+    var dBuckets = {};
+    for (var i=0;i<x.length;i++) {
+
+      dBuckets[x[i].bucket_corrected] = x[i].bucket_corrected;
+      useBuckets = ["liquor_store", "tobacco_cigar", "vape_smoke", "convenience"];
+
+      //if (useBuckets.indexOf(x[i].bucket_corrected) < 0) {
+      //  continue;
+      //}
+      //if (!x[i].in_ohio) {
+      //  continue;
+      //}
+
+      //console.log(x[i]);
+      //console.log(x[i].name, x[i].lat, x[i].lng);
+      var nearestSchool = (x[i].nearest_school_distance_m*3.2808399).toFixed(1);
+      var mColor = "black";
+      var mRadius = 2;
+      if (nearestSchool < 500) {
+        mColor = "red";
+        mRadius = 5;
+      }
+
+      if (nearestSchool < 500) {
+        mColor = "red";
+        mRadius = 5;
+        addNotableArea(x[i]);
+      }
+
+      
+      var marker = L.circleMarker( [ x[i].lat, x[i].lng ] , {
+        pane: "placesPane",
+        radius: mRadius,
+        color: mColor,      // outline color
+        weight: 1,
+        fillColor: mColor,  // fill color
+        fillOpacity: 1
+      });
+      marker.addTo(map);
+      var mwContent = ""
+        + x[i].place_id+"<hr />"
+        + x[i].name+"<hr>"
+        +x[i].bucket_corrected+"<hr />"
+        +x[i].formatted_address
+        +"<hr />"
+        +"Nearest School: "
+        + x[i].nearest_school_name+"<br />"
+        + x[i].nearest_school_address
+        + "(" + nearestSchool + " feet)"
+      ;
+      marker.bindTooltip(mwContent); //.openTooltip();
+      var popupContent = document.createElement("div");
+      marker.bindPopup(mwContent);
+      const placeName = x[i].name;
+    }
+
+    //console.log("dBuckets:", dBuckets);
+  });
+
+}
+
+
+
+
+// --- distance in feet (Haversine) ---
+function distanceFeet(a, b) {
+  const lat1 = a.lat ?? a.latitude;
+  const lon1 = a.lng ?? a.lon ?? a.longitude;
+  const lat2 = b.lat ?? b.latitude;
+  const lon2 = b.lng ?? b.lon ?? b.longitude;
+
+  if ([lat1, lon1, lat2, lon2].some(v => typeof v !== "number" || Number.isNaN(v))) {
+    throw new Error("distanceFeet: inputs must contain numeric lat/lng (or latitude/longitude).");
+  }
+
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371008.8; // meters (mean Earth radius)
+
+  const φ1 = toRad(lat1);
+  const φ2 = toRad(lat2);
+  const Δφ = toRad(lat2 - lat1);
+  const Δλ = toRad(lon2 - lon1);
+
+  const sinΔφ2 = Math.sin(Δφ / 2);
+  const sinΔλ2 = Math.sin(Δλ / 2);
+
+  const h =
+    sinΔφ2 * sinΔφ2 +
+    Math.cos(φ1) * Math.cos(φ2) * sinΔλ2 * sinΔλ2;
+
+  const meters = 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+  return meters * 3.280839895; // feet
+}
+
+/**
+ * Right-click distance tool:
+ * - Right-click once => sets start point (dot)
+ * - Right-click again => sets end point (dot), draws line, shows popup with feet
+ * - Any LEFT click anywhere => clears existing measurement and starts fresh
+ */
+function enableRightClickDistanceTool(map) {
+  let start = null;          // L.LatLng
+  let startMarker = null;    // L.CircleMarker
+  let endMarker = null;      // L.CircleMarker
+  let line = null;           // L.Polyline
+  let popup = null;          // L.Popup
+
+  function clearMeasurement() {
+    start = null;
+
+    if (startMarker) { map.removeLayer(startMarker); startMarker = null; }
+    if (endMarker)   { map.removeLayer(endMarker);   endMarker = null; }
+    if (line)        { map.removeLayer(line);        line = null; }
+    if (popup)       { map.closePopup(popup);        popup = null; }
+  }
+
+  // Left click clears and prepares for a new measurement
+  //map.on("click", () => {
+  //  clearMeasurement();
+  //});
+
+  // Right click sets points / draws
+  map.on("contextmenu", (e) => {
+    // prevent the browser context menu (Leaflet usually does, but extra-safe)
+    if (e.originalEvent?.preventDefault) e.originalEvent.preventDefault();
+
+    // If we already have a completed measurement (line exists), start over
+    if (line || endMarker) {
+      clearMeasurement();
+    }
+
+    if (!start) {
+      // First right-click => start point
+      start = e.latlng;
+
+      startMarker = L.circleMarker(start, {
+        radius: 6,
+        weight: 2,
+        fillOpacity: 1
+      }).addTo(map);
+
+      // optional tiny hint
+      startMarker.bindTooltip("Start (right-click again to finish)", { permanent: false });
+      return;
+    }
+
+    // Second right-click => end point + line + popup
+    const end = e.latlng;
+
+    endMarker = L.circleMarker(end, {
+      radius: 6,
+      weight: 2,
+      fillOpacity: 1
+    }).addTo(map);
+
+    line = L.polyline([start, end], { weight: 3 }).addTo(map);
+
+    const feet = distanceFeet(start, end);
+
+    // Put popup at midpoint so it doesn't cover the dots
+    const mid = L.latLng((start.lat + end.lat) / 2, (start.lng + end.lng) / 2);
+
+    popup = L.popup({ closeButton: true, autoClose: false, closeOnClick: false })
+      .setLatLng(mid)
+      .setContent(`Distance: <b>${feet.toFixed(1)}</b> ft`)
+      .addTo(map);
+  });
+
+  // return a small API in case you want to disable/clear later
+  return {
+    clear: clearMeasurement,
+    disable: () => {
+      clearMeasurement();
+      map.off("click");
+      map.off("contextmenu");
+    }
+  };
+}
+
+// Usage:
+const tool = enableRightClickDistanceTool(map);
+// tool.clear();   // optional
+// tool.disable(); // optional
+
+
+
+
+
+drawOhio();
+loadSchools();
+loadPlaces();
+loadParcelProximities();
+//  drawParcels();
+
+
+</script>
