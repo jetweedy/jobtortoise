@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-detect_job_systems.py
+sandbox5.py
 
 Read schools.txt (one school domain per line, e.g. unc.edu), probe likely
 career/job URLs, and classify the institution's job posting system.
@@ -18,8 +18,8 @@ Fields:
   - notes
 
 Usage:
-  python detect_job_systems.py
-  python detect_job_systems.py --inputs schools.txt --workers 20 --timeout 12
+  python sandbox5.py
+  python sandbox5.py --inputs schools.txt --workers 20 --timeout 12
 
 Dependencies:
   pip install requests beautifulsoup4
