@@ -69,7 +69,7 @@ hr_systems = {
 //// We can make a map with it by handing the ID of the element that will contain it ('map'):
 var map = L.map('map');
 //// Then we can set the lat/lng and the initial zoom:
-map.setView([35.91094558143209, -79.0510950932315], 13);
+map.setView([40, -100], 4);
 //// And we can specify a tile layer, as well as a maximum possible zoom:
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 18
@@ -117,7 +117,7 @@ function processSchoolData(schools) {
 }
 
 circleMarkerColors = {
-  "empty":"white",
+  "empty":"pink",
   "changed":"lightgreen",
   "complete":"gray",
 }
@@ -133,7 +133,7 @@ function loadSchools() {
         mColor = circleMarkerColors["empty"];
       }
       var oColor = "black";
-      var mRadius = 5;
+      var mRadius = (x.instsize)*2+2;
       var marker = L.circleMarker( [ x.latitude, x.longitud ] , {
         pane: "schoolsPane",
         radius: mRadius,

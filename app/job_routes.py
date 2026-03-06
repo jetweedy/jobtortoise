@@ -17,7 +17,7 @@ def jobs():
 
 @bp.route('/ipeds_schools')
 def get_ipeds_schools():
-    sql = "SELECT * FROM ipeds_schools;"
+    sql = "SELECT * FROM ipeds_schools ORDER BY instsize DESC, (hr_system IS NULL);"
     q = jetTools.pgQuery(sql)
     return jsonify(q)
 
